@@ -1,15 +1,14 @@
+已按你的要求清理：删除 NVIDIA/旧依赖、旧启动脚本、历史实测与“本次优化”等迭代表述，并去掉对 `RELEASE_NOTES.md` 的引用。下面是修改后的 README.md。
+
 # 网络干涉因果决策 PFN 摩尔线程版
 
-目标为 Linux、Python 3.10、摩尔线程 PyTorch 2.7.1 和 torch_musa 2.7.1。运行时已去除 PyG 稀疏扩展与 NVIDIA 依赖；提供单卡及 DDP 加 MCCL 的八卡同步元训练。算法说明保留如下，本次优化说明见 [RELEASE_NOTES.md](RELEASE_NOTES.md)。
+目标为 Linux、Python 3.10、摩尔线程 PyTorch 2.7.1 和 torch_musa 2.7.1。提供单卡及 DDP + MCCL 的八卡同步元训练。算法说明如下。
 
-这份发布版固化了 2026-10-13 在 8 张 MTT S5000 上验证过的优化：
-Sequential 单 Update 最近一次实测 **77.89 秒**。这个数字来自原实验的
-`--env-workers=2`/CPU 2 线程配置，不保证新的默认并行参数具有完全相同耗时。
-发布包不包含 `runs/`、`profiles/`、`logs/`、已训练权重或一次性优化安装器。
+发布包不包含 `runs/`、`profiles/`、`logs/` 或已训练权重。
 
 ## 标准启动与管理
 
-在已安装 PyTorch/torch_musa 2.7.1 的主机上，进入最终项目：
+在已安装 PyTorch/torch_musa 2.7.1 的主机上，进入项目：
 
 ```bash
 cd /home/mccxadmin/PFN_network_interference_musa_optimized
@@ -21,10 +20,7 @@ bash PFN_network_interference_musa_start.sh check    # 8 卡通讯自检
 bash PFN_network_interference_musa_start.sh dry-run  # 打印启动命令但不启动
 ```
 
-默认 `NPROC_PER_NODE=8`、`CPU_THREADS=4`、`ENV_WORKERS=16`；
-均可通过同名环境变量调整。**性能优化全部已固化，不需要设置任何优化开关。**
-旧启动脚本的锁、后台执行、恢复和状态查询语义保持不变。更多说明参见
-[RELEASE_NOTES.md](RELEASE_NOTES.md)。
+默认 `NPROC_PER_NODE=8`、`CPU_THREADS=4`、`ENV_WORKERS=16`；均可通过同名环境变量调整。
 
 ## 其他命令行运行方式
 
@@ -38,7 +34,7 @@ python -m pfn_network.train_eval.run --config configs/smoke.json --stage all --d
 bash scripts/train_ddp.sh --config configs/default.json --output runs/ddp_train
 ```
 
-CPU 诊断显式使用 `--device cpu`。多卡的全局任务数和 minibatch 必须能被卡数整除；八卡短测试使用 `configs/smoke_ddp.json`。依赖版本以用户原始 `package_versions.txt` 为准。
+CPU 诊断显式使用 `--device cpu`。多卡的全局任务数和 minibatch 必须能被卡数整除；八卡短测试使用 `configs/smoke_ddp.json`。依赖版本以 `package_versions.txt` 为准。
 
 ## 2. 源码结构
 
@@ -147,7 +143,7 @@ np.savez("task_0.npz", mu_hat=mu_hat, adjacency=A, features=X)
 
 `logsigmoid` 避免概率饱和后的 log(0)。联合头使用处理/未处理节点池化、精确/多数暴露池化、被共同处理的边比例和全局历史。合法性处理为 `logits.masked_fill(~mask, -1e9)` 后创建 `Categorical`。不先 softmax 再乘 mask。整个候选分配是一次环境动作，不按节点累计多个“交互”。
 
-PPO 用冻结旧策略采样完整 episode，保留旧联合 log probability、当时的 mask、原始可见状态与历史、已执行 action id 和完整分配。更新时重新编码这些原始输入，不替换旧 log probability，不重新采样动作。关闭 dropout，以保持概率比的定义。变长样本采用 padding 和 batched Transformer，历史记录及图状态打包复用。MUSA 版本使用基础张量图聚合和显式注意力；DDP 在每次全局 minibatch 上同步梯度，未开启 AMP。
+PPO 用冻结旧策略采样完整 episode，保留旧联合 log probability、当时的 mask、原始可见状态与历史、已执行 action id 和完整分配。更新时重新编码这些原始输入，不替换旧 log probability，不重新采样动作。关闭 dropout，以保持概率比的定义。变长样本采用 padding 和 batched Transformer，历史记录及图状态打包复用。实现使用基础张量图聚合和显式注意力；DDP 在每次全局 minibatch 上同步梯度，未开启 AMP。
 
 GAE 按 episode 倒序计算，终止 `L=0` 的 **bootstrap value=0**。最后一步训练 target 是实际末步奖励 `R_{T-1}`，不是强行设为 0；把末步奖励 target 设为 0 会丢失真实收益。返回、优势与 value target 均不跨 episode 传播。代码只收完整 episode，因此没有 rollout 中途截断。policy/value/entropy 损失均保留 `gamma**t` 权重。
 
@@ -200,7 +196,7 @@ python -m pfn_network.train_eval.run --stage plot --results runs/evaluation
 python -m pytest tests -q
 ```
 
-图中阴影为先种子平均、再跨任务的标准差。测试覆盖 FC/CD 手算值、非法动作不消耗噪声、step 不重算暴露、终止 GAE、Dyna 频次、K=0 一致性、评估只读、掩码有限梯度和节点置换一致性。本地 CPU 回归和目标机 MUSA 实测范围见 RELEASE_NOTES.md。
+图中阴影为先种子平均、再跨任务的标准差。测试覆盖 FC/CD 手算值、非法动作不消耗噪声、step 不重算暴露、终止 GAE、Dyna 频次、K=0 一致性、评估只读、掩码有限梯度和节点置换一致性。
 
 ## 9. 单任务恢复与范围
 
@@ -210,6 +206,4 @@ python -m pytest tests -q
 
 默认表 2 不包含历史 PFN bandit 的额外训练对照；P4 是混合 FC/CD 预训练，不能直接把这些权重称为已训练好的无动态 bandit 策略。所有结果都应保留其目标与信息条件。
 
-用户提供的 End_to_End_PFN_Policy.tex 已原样附带，作为本次优化的技术约束。模拟中的静态随机化识别，也不自动证明观察性日志下的动态策略可识别；本实现的 P4 依赖实际执行动作后获得的事实反馈。
-
-本次优化改动及未实测范围见 [RELEASE_NOTES.md](RELEASE_NOTES.md)。
+用户提供的 End_to_End_PFN_Policy.tex 已原样附带。模拟中的静态随机化识别，也不自动证明观察性日志下的动态策略可识别；本实现的 P4 依赖实际执行动作后获得的事实反馈。
