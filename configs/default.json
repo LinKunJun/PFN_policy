@@ -1,0 +1,59 @@
+{
+  "seed": 20261011,
+  "prior": {
+    "n": 30,
+    "feature_dim": 4,
+    "budget": 8,
+    "catalog_size": 48,
+    "horizon": 6,
+    "graph_family": "mixed",
+    "edge_probability": 0.15,
+    "node_noise": 0.5,
+    "fatigue_cost": 1.0
+  },
+  "model": {
+    "feature_dim": 4,
+    "width": 64,
+    "graph_layers": 2,
+    "transformer_layers": 2,
+    "heads": 4,
+    "context_length": 384,
+    "joint_head": true,
+    "history": true
+  },
+  "ppo": {
+    "learning_rate": 0.0003,
+    "gamma": 1.0,
+    "gae_lambda": 0.95,
+    "clip": 0.2,
+    "value_coef": 0.5,
+    "entropy_coef": 0.01,
+    "epochs": 4,
+    "minibatch": 2048,
+    "max_grad_norm": 0.5
+  },
+  "meta": {
+    "updates": 300,
+    "tasks_per_update": 512,
+    "episodes_per_task": 80,
+    "validate_every": 50,
+    "validation_tasks": 10
+  },
+  "evaluation": {
+    "test_tasks": 5,
+    "seeds": [0, 1, 2, 3, 4],
+    "episodes": 8,
+    "adaptation_interactions": 1200,
+    "evaluate_every": 120,
+    "bandit_rounds": 1000,
+    "target_fraction": 0.8,
+    "deterministic_neural_eval": true
+  },
+  "planning": {"max_states": 500000, "seconds": 120.0},
+  "bandit": {"epsilon": 0.1, "ucb_c": 1.0},
+  "tabular": {"alpha": 0.1, "epsilon_start": 0.3, "epsilon_end": 0.05, "epsilon_decay": 2000},
+  "dyna_steps": 10,
+  "grasp_restarts": 16,
+  "estimation_rounds": 64,
+  "prediction_dir": null
+}

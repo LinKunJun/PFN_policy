@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pfn-network-interference"
+version = "0.1.0"
+description = "Factual graph-transformer meta-RL under network interference"
+requires-python = ">=3.10"
+# Torch is supplied by the MUSA image and checked by scripts/check_environment.py.
+dependencies = ["numpy==1.26.4", "scipy==1.10.1", "scikit-learn==1.7.2", "pandas==2.3.3"]
+
+[project.optional-dependencies]
+analysis = ["matplotlib"]
+test = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["pfn_network*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

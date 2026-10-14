@@ -1,0 +1,627 @@
+% Standalone manuscript: references are embedded; no external .bib file required.
+% Empirical results and experiment-specific configurations are intentionally blank.
+\documentclass[UTF8,a4paper,11pt,fontset=fandol]{ctexart}
+\usepackage[margin=24mm]{geometry}
+\usepackage{amsmath,amssymb,mathtools,booktabs,tabularx,array}
+\usepackage{algorithm,algpseudocode,enumitem}
+\usepackage[numbers,sort&compress]{natbib}
+\usepackage{xcolor,xurl,hyperref,bookmark}
+\ctexset{section={format=\Large\bfseries},subsection={format=\large\bfseries},subsubsection={format=\normalsize\bfseries}}
+\hypersetup{colorlinks=true,linkcolor=blue!45!black,citecolor=blue!45!black,urlcolor=blue!45!black,pdftitle={网络干涉下的因果决策框架：从静态分配到摊销序贯强化学习}}
+\urlstyle{same}
+\setlength{\emergencystretch}{3em}
+\setlength{\parskip}{3pt}
+\setlist{itemsep=2pt,topsep=4pt}
+\renewcommand{\arraystretch}{1.17}
+\renewcommand{\bibfont}{\small}
+\newcolumntype{L}{>{\raggedright\arraybackslash}X}
+\newcommand{\E}{\mathbb E}
+\newcommand{\ind}{\mathbf 1}
+\newcommand{\sg}{\operatorname{sg}}
+\newcommand{\clip}{\operatorname{clip}}
+\newcommand{\blank}{\underline{\hspace{1.5cm}}}
+\newcommand{\resultspace}{\par\vspace{1.0cm}}
+\numberwithin{equation}{section}
+\floatname{algorithm}{算法}
+\algrenewcommand{\algorithmicrequire}{\textbf{输入：}}
+\algrenewcommand{\algorithmicensure}{\textbf{输出：}}
+\title{网络干涉下的因果决策框架：\\从静态分配到摊销序贯强化学习}
+\author{}
+\date{}
+\begin{document}
+\maketitle
+
+\begin{abstract}
+社交网络中的干预分配同时受到网络溢出、资源预算与历史依赖的影响。已有的静态 PFN 预测与组合优化方法先估计处理--暴露响应面，再搜索单期分配，难以直接处理重复干预中的未来成本、冷却约束与未知环境适应。本文建立一个递进式网络干涉决策框架，依次研究离线静态组合优化、固定候选池上的在线探索、已知动态模型下的有限时域规划，以及事实交互驱动的摊销 PFN 序贯策略。核心方法融合图神经网络与 Transformer，将网络结构、当前状态和历史轨迹映射为合法完整分配的联合概率，并通过策略梯度跨任务训练，以长期回报直接优化决策。本文统一定义多数暴露评分、实际干预收益、预算与动态边际价值，保留候选集限制和因果识别的适用条件，给出可复现的基线、理论核对实例与实验评价方案。实验分别考察求解质量、候选集内伪遗憾、规划前瞻收益、测试任务样本效率和部署延迟；实证结果留待实验完成后填入。
+\end{abstract}
+\noindent\textbf{关键词：}网络干涉；因果决策；PFN；马尔可夫决策过程；摊销强化学习；动作掩码
+
+\section{引言（Introduction）}
+在社交网络中分配学习提醒、信息推送或其他有限资源时，个体结果不仅取决于自身是否接受干预，还取决于邻居的干预情况。例如，对一名学生发送提醒可能通过同伴交流影响未接受提醒的学生。网络干涉使资源分配成为联合决策：同一节点的选择会改变多个个体的暴露，逐个节点排序通常不足以得到高收益名单。暴露映射、分配设计与因果目标之间的关系构成此类问题的建模基础\citep{aronow2017}。
+
+之前的工作采用静态的“先预测，后优化”（Predict-then-Optimize）范式：先由先验数据拟合网络（Prior-Data Fitted Network, PFN）估计四个处理--多数暴露响应均值，再由贪心或其他组合优化方法选择名单。该工作提供了响应预测接口与静态决策基础。本文在此基础上扩展决策问题；前期实验的具体数值将在统一核对数据与评价口径后补入实验部分。
+
+在重复干预与未知环境下，静态范式需要进一步考虑以下两方面问题。一方面，网络多数阈值可能产生联合收益，单步贪心可能遗漏协同分配，而更充分的组合搜索会增加逐实例计算开销。另一方面，重复干预会影响后续收益与可用性：今天的处理可能使明天产生疲劳成本，或使节点在随后两期无法再次接受处理。当前收益最高的名单因此未必具有最高的长期价值。此外，环境响应未知时，动作还承担收集信息的作用，决策需要兼顾探索和利用。
+
+本文将这些问题组织为四个相互衔接的决策场景，而非假设所有场景具有相同的信息条件：
+\begin{enumerate}
+  \item \textbf{离线静态求解。}以固定响应评分为目标，通过局部交换、多起点搜索与精确参照研究联合分配质量和计算成本。
+  \item \textbf{在线自适应探索。}在无物理状态转移的环境中，将完整分配作为 Bandit 臂，以事实奖励修正候选方案的收益排序。
+  \item \textbf{已知动态模型规划。}引入一期疲劳成本和两期冷却约束，用精确动态规划与滚动规划刻画前瞻价值及状态空间限制。
+  \item \textbf{摊销 PFN 序贯策略。}以图网络与 Transformer 编码状态和轨迹，通过强化学习跨任务训练共享策略，在新任务中利用上下文直接产生合法分配。这是本文的核心方法。
+\end{enumerate}
+
+PFN 的原始思想是从任务先验中抽取数据，训练共享网络实现新任务上的上下文推断\citep{muller2022}。本文将这一思想拓展为以长期回报为目标的策略学习：训练阶段承担跨任务学习成本，部署阶段冻结参数，依据可见状态与事实历史决策。这里的“端到端”指策略参数由分配产生的回报直接优化，部署时直接输出决策，而不必先重建完整响应面再调用逐实例优化器；这并不意味着自动获得全局最优性、因果识别保证或任意分布下的泛化保证。本文提出的方法设计与待验证的性能假设，将通过统一实验分别检验。
+
+\section{问题建模（Problem Formulation）}
+\subsection{静态网络干涉模型}
+\label{sec:static-model}
+设处理前固定无向图为 $G=(\mathcal V,\mathcal E,A)$，节点数为 $N$，$A$ 是对称二元邻接矩阵且 $A_{ii}=0$。节点特征为 $X_i$，邻居集合为 $\mathcal N(i)$，度为 $d_i=\sum_j A_{ij}$。给定完整分配 $\mathbf z\in\{0,1\}^N$，定义
+\begin{align}
+K_i(\mathbf z)&=\sum_j A_{ij}z_j,
+&E_i(\mathbf z)&=K_i(\mathbf z)/d_i,\\
+S_i(\mathbf z)&=\ind\{K_i(\mathbf z)>\lfloor d_i/2\rfloor\}.
+\end{align}
+$S_i$ 表示严格多数暴露，恰有一半邻居接受处理时取零。主设定取 $d_i>0$；若研究孤立节点，规定其 $E_i=S_i=0$，不对没有支持的多数暴露类别估计因果均值。
+
+\paragraph{设计标准化响应面。}
+为避免处理变量与总时域混淆，记初始随机实验分配为 $\mathbf W$，其中 $W_i\overset{\mathrm{iid}}{\sim}\mathrm{Bernoulli}(1/2)$。节点层面的四臂响应面为
+\begin{equation}
+\mu_i(a,s)=\E\!\left[Y_i((a,\mathbf W_{-i}))
+\mid S_i((a,\mathbf W_{-i}))=s,G,X\right],\qquad a,s\in\{0,1\}.
+\label{eq:mu}
+\end{equation}
+在一致性、完整处理向量随机化与 $\Pr(W_i=a,S_i=s\mid G,X)>0$ 下，该目标等于相应可观测条件均值。响应面允许节点异质性，统一写为 $\mu_i(a,s)$。条件均值的总体识别并不意味着一张网络上的单次观测足以逐节点精确估计四个均值；PFN 预测还依赖跨节点、跨任务的建模与先验。
+
+设静态 PFN 给出的估计为 $\widehat\mu_i(a,s)$。预测评分、真实多数评分与固定分配的实际期望收益分别定义为
+\begin{align}
+\widehat V(\mathbf z)&=\frac1N\sum_i\widehat\mu_i(z_i,S_i(\mathbf z)),\\
+V_\mu(\mathbf z)&=\frac1N\sum_i\mu_i(z_i,S_i(\mathbf z)),\\
+V_{\mathrm{env},\psi}(\mathbf z)&=\frac1N\sum_i m_{i,\psi}(z_i,E_i(\mathbf z)).
+\label{eq:three-values}
+\end{align}
+这里 $m_{i,\psi}(a,e)$ 是任务 $\psi$ 中精确邻居暴露下的响应均值，采用精确暴露充分描述静态响应的模拟设定。式~\eqref{eq:mu} 对同一多数类别中的完整分配进行设计平均，因此即使 $\widehat\mu=\mu$，一般也不能推出 $V_\mu=V_{\mathrm{env},\psi}$。将多数暴露视为充分响应映射需要额外假设。实验据此分开评估预测目标优化质量和实际收益。
+
+\paragraph{预算与分配。}
+令 $B\in\{0,\ldots,N\}$ 为人数预算，定义
+\begin{equation}
+\mathcal Z_B^{=} =\{\mathbf z:\|\mathbf z\|_1=B\},\qquad
+\mathcal Z_B^{\leq}=\{\mathbf z:\|\mathbf z\|_1\leq B\},\qquad
+\mathbf z\in\{0,1\}^N.
+\label{eq:budget}
+\end{equation}
+记预算模式为 $\kappa\in\{=,\leq\}$，静态目标是
+$\max_{\mathbf z\in\mathcal Z_B^\kappa}\widehat V(\mathbf z)$。
+向量 $(0,1,0,0,1,\ldots)$ 表示第 2、5 个节点接受处理，向量位置对应节点，不是干预时刻。
+
+单节点添加的静态边际评分为
+\begin{equation}
+\Delta_j(\mathbf z)=\widehat V(\mathbf z+\mathbf e_j)-\widehat V(\mathbf z),\qquad z_j=0.
+\label{eq:static-marginal}
+\end{equation}
+其变化包含节点 $j$ 自身响应以及邻居暴露变化。严格人数预算下，比较最终可行分配应采用一进一出的交换边际，而不能将不满足预算的添加视为最终可行动作。
+
+\subsection{序贯决策扩展（MDP Formulation）}
+\label{sec:mdp}
+令 $t=0,\ldots,T-1$，剩余期数为 $L_t=T-t$，折扣因子为 $0<\gamma\leq1$。每期执行完整分配 $\mathbf z_t$，整条分配轨迹为 $Z=(\mathbf z_0,\ldots,\mathbf z_{T-1})$。策略根据当前信息逐期产生向量，通常不是在初始时刻一次性承诺整条开环轨迹。预算 $B$ 每期重置，不是跨期递减的资源总量。
+
+\paragraph{一期疲劳成本（Fatigue Cost, FC）。}
+记上一期分配为 $\mathbf f_t$，初始 $\mathbf f_0=\mathbf0$。状态与转移为
+\begin{equation}
+q_t=(L_t,\mathbf f_t),\qquad
+\mathbf f_{t+1}=\mathbf z_t,\qquad L_{t+1}=L_t-1.
+\end{equation}
+令 $R_t^{\mathrm{base}}=N^{-1}\sum_iY_{i,t}(\mathbf z_t)$，则
+\begin{equation}
+R_t^{\mathrm{FC}}=R_t^{\mathrm{base}}-\frac{c_f}{N}\|\mathbf f_t\|_1,\qquad c_f\geq0.
+\label{eq:fc}
+\end{equation}
+该定义保留原有模型的一期历史成本：上一期处理人数只在当前期产生一次成本，不自动降低同一节点再次处理的效果，也不限制其再次被选。FC 可采用两种人数预算。终点之后不额外计入历史成本。
+
+\paragraph{两期冷却约束（Cooldown, CD）。}
+令 $h_{i,t}\in\{0,1,2\}$ 为节点剩余等待期数，初始为零，可用性为 $\chi_{i,t}=\ind\{h_{i,t}=0\}$。状态为 $q_t=(L_t,\mathbf h_t)$，采用最多人数预算，并要求 $z_{i,t}\leq\chi_{i,t}$。转移为
+\begin{equation}
+h_{i,t+1}=\begin{cases}
+2,&z_{i,t}=1,\\
+\max\{h_{i,t}-1,0\},&z_{i,t}=0,
+\end{cases}
+\qquad R_t^{\mathrm{CD}}=R_t^{\mathrm{base}}.
+\label{eq:cd}
+\end{equation}
+第 $t$ 期处理后，第 $t+1,t+2$ 期不能再次处理，第 $t+3$ 期恢复。邻居不会因该节点被处理而自动进入冷却。CD 不叠加 FC 成本；只保存二元可用性不足以区分还需等待一期或两期的状态。
+
+\paragraph{固定候选池与合法动作。}
+为使探索、规划与策略学习能够在同一动作空间比较，定义互异且非空的候选池
+\begin{equation}
+\mathcal C=\{\mathbf z^{(1)},\ldots,\mathbf z^{(M)}\}\subseteq\mathcal Z_B^\kappa.
+\label{eq:catalog}
+\end{equation}
+动作编号 $a_t\in\{1,\ldots,M\}$ 对应 $\mathbf z_t=\mathbf z^{(a_t)}$。FC 的合法集合为全部候选；CD 为
+\begin{equation}
+\mathcal A(q_t)=\{a:\ z_i^{(a)}\leq\chi_{i,t}\ \forall i\},\qquad
+M_t(a)=\ind\{a\in\mathcal A(q_t)\}.
+\label{eq:feasible}
+\end{equation}
+CD 候选池包含全零分配，从而始终允许等待。静态高评分候选并不一定覆盖动态最优序列；候选构造还应覆盖不同人数和节点组合。候选集合、节点顺序和编号在单次运行中固定，最优性参照均明确限定于该动作空间。
+
+\paragraph{信息条件、因果解释与价值目标。}
+固定任务 $\psi$ 下，奖励和下一状态只依赖当前状态与动作，形成有限时域 MDP；终端 $L=0$ 的价值为零。模型已知时，规划器读取指定奖励 $r_m$ 和转移 $F$。其中 $m=\mathrm{score}$ 使用 $\widehat V$ 与上述动态规则，$m=\mathrm{env}$ 使用实际条件期望，两者分别定义
+\begin{equation}
+J_{\psi,m}(\pi)=\E_\pi\!\left[\sum_{t=0}^{T-1}\gamma^t r_m(q_t,a_t)\right].
+\end{equation}
+交互学习以事实回报为目标：
+\begin{equation}
+J_\psi(\pi)=\E_{\pi,\psi}\!\left[\sum_{t=0}^{T-1}\gamma^tR_t\right].
+\label{eq:return}
+\end{equation}
+未知任务中的学习器只看到当前状态、合法动作以及已执行动作的事实记录。预算和冷却可用性是公开约束；“模型未知”指不向学习器提供可查询的完整奖励--转移模型，不意味着连合法动作也不可观测。任务参数未知时，物理状态仍是固定任务下的马尔可夫状态，但历史还提供关于任务的知识，策略输入应包含上下文。
+
+静态随机化识别并不能自动识别动态干预效果；将静态评分叠加人工动态规则，仅定义一个规划模型。若从观察性日志推断序贯策略价值，还需一致性、给定历史的序贯可交换性和相关完整动作的正支持，以及足够的状态记录。本文的主要学习协议允许训练时进行实际或模拟交互，反馈仅来自已执行动作，不把未选动作的潜在结果交给学习器。
+
+定义 $Q_{m,L}^\pi(x,a)$ 为状态记忆 $x$、剩余 $L$ 期时先执行 $a$、此后遵循 $\pi$ 的期望回报。动态边际价值为
+\begin{equation}
+\Delta_{m,L}^\pi(x;a',a)=Q_{m,L}^\pi(x,a')-Q_{m,L}^\pi(x,a),\qquad
+a,a'\in\mathcal A((L,x)).
+\label{eq:dynamic-marginal}
+\end{equation}
+它同时包括即时直接与溢出收益、未来疲劳成本以及冷却导致的机会变化，不能由固定的个体处理效应替代。
+
+\section{递进式网络决策框架（Progressive Decision Framework）}
+\subsection{离线静态策略的组合优化（Offline Static Optimization）}
+\label{sec:offline}
+本场景假定供决策使用的响应表已经给定，且动作不改变未来状态。若响应面为估计值，算法求解的是预测目标而非已知真实收益。严格预算的搜索空间有 $\binom NB$ 个分配，最多预算有 $\sum_{b=0}^B\binom Nb$ 个分配。
+
+\paragraph{贪心与局部交换。}
+Forward Greedy 从空分配出发，反复加入式~\eqref{eq:static-marginal} 最大的节点。严格预算执行 $B$ 次添加；最多预算可在最大边际不再为正时停止。每次动作改变后重新计算相关暴露。Local Swap 在初始分配上搜索一进一出的可行交换，直至没有超过数值容差的改进；最多预算另允许单节点添加或删除。扩大邻域可包含双添加、双删除和两对交换，但需要单独计入搜索成本。改变节点集合 $C$ 只影响 $C\cup\bigcup_{j\in C}\mathcal N(j)$ 的评分项，可通过邻居处理计数进行增量更新。
+
+\paragraph{多起点联合搜索。}
+贪心随机自适应搜索（Greedy Randomized Adaptive Search Procedure, GRASP）\citep{feo1995} 的每次重启包含随机贪心构造与局部改进。构造时从受限候选集中采样：
+\begin{equation}
+\mathcal R_\rho=\{j:\Delta_j\geq\Delta_{\max}-\rho(\Delta_{\max}-\Delta_{\min})\},\qquad \rho\in[0,1].
+\end{equation}
+严格预算构造 $B$ 人，最多预算允许不同构造人数；每次构造后进行局部交换，并在固定重启次数或时间预算内保留最佳结果。将 Greedy 结果作为初始 incumbent，可保证最终返回评分不低于该初始解，但并不保证严格改进或全局最优。候选池可由各次搜索得到的互异高评分分配、不同预算水平分配和必要的等待动作构成。
+
+\paragraph{精确参照。}
+多数暴露评分可表示为混合整数线性规划（MILP）。令 $\tau_i=\lfloor d_i/2\rfloor+1$，以二元 $s_i$ 表示多数暴露、$u_i=z_is_i$ 表示乘积，施加
+\begin{align}
+\sum_jA_{ij}z_j&\geq\tau_is_i,&
+\sum_jA_{ij}z_j&\leq\tau_i-1+(d_i-\tau_i+1)s_i,\\
+0\leq u_i&\leq z_i,&u_i&\leq s_i,\qquad u_i\geq z_i+s_i-1.
+\end{align}
+定义 $\alpha_i=\widehat\mu_i(1,0)-\widehat\mu_i(0,0)$、
+$\beta_i=\widehat\mu_i(0,1)-\widehat\mu_i(0,0)$ 和
+$\delta_i=\widehat\mu_i(1,1)-\widehat\mu_i(1,0)-\widehat\mu_i(0,1)+\widehat\mu_i(0,0)$，则目标为
+\begin{equation}
+\max\frac1N\sum_i[\widehat\mu_i(0,0)+\alpha_i z_i+\beta_i s_i+\delta_i u_i],
+\end{equation}
+并结合预算约束。只有获得全局最优性认证的结果才称为精确最优；限时求解同时报告可行值、上界与最优性间隙。
+
+\paragraph{局限与递进关系。}
+严格多数阈值可能产生单步负增益、联合正增益。例如三节点完全图、$B=2$ 的最多预算下，设所有节点 $\mu_i(0,0)=0$、$\mu_i(1,0)=-1$、$\mu_i(a,1)=10$。空分配、单人分配、两人分配的评分分别为 $0,-1/3,8/3$；只接受正单步增益的 Greedy 停在空分配。局部扩大邻域与多起点搜索能缓解此类障碍，但需要额外计算，且静态评分本身不描述未来状态。下一场景先引入反馈学习，随后再引入物理动态。
+
+\subsection{候选策略池的在线自适应探索（Online Adaptive Exploration）}
+\label{sec:bandit}
+固定网络、预算和候选池后，将每个完整分配视为一个 Bandit 臂，而非将各节点分别作为互不相关的臂。此时没有疲劳或冷却，动作不改变后续物理状态，未知均值为
+\begin{equation}
+m_a=V_{\mathrm{env},\psi}(\mathbf z^{(a)}),\qquad R_t=m_{a_t}+\xi_t.
+\end{equation}
+若节点噪声独立且服从 $\mathcal N(0,\sigma^2)$，则 $\xi_t\sim\mathcal N(0,\sigma_R^2)$，$\sigma_R^2=\sigma^2/N$；存在相关噪声时必须重新计算聚合方差。候选均值在一次运行中固定，变化的是对其收益的认识。
+
+\paragraph{连续奖励 UCB。}
+令 $n_a(t)=\sum_{u<t}\ind\{a_u=a\}$，$\bar R_a(t)$ 为已观察样本均值。首先依次访问未观察候选，随后按
+\begin{equation}
+a_t\in\arg\max_a\left\{\bar R_a(t)+c\sigma_R
+\sqrt{\frac{2\log(\max\{2,t+1\})}{n_a(t)}}\right\}
+\label{eq:ucb}
+\end{equation}
+选择动作，$c$ 由验证环境确定。该指数使用置信上界的探索思想\citep{auer2002}，与此处的高斯奖励尺度对应，不直接宣称适用有界奖励 UCB1 的全部理论结论。首次观察及初始化均计入交互预算；当 $T<M$ 时，仅完成前 $T$ 个候选的首次访问。并列时采用预先固定的规则，并通过候选重排实验检查初始化顺序的影响。
+
+\paragraph{基线与评价目标。}
+Random 均匀采样候选；$\varepsilon$-greedy 以概率 $1-\varepsilon_t$ 选择当前经验得分最大动作，其余概率均匀探索，未访问得分的初始化须明确记录。FrozenPFN 始终选择 $a_F\in\arg\max_a\widehat V(\mathbf z^{(a)})$，收到奖励后不更新排序。设 $m_*=\max_a m_a$，候选集内伪遗憾为
+\begin{equation}
+\mathcal R_T=\sum_{t=0}^{T-1}(m_*-m_{a_t}).
+\label{eq:regret}
+\end{equation}
+其期望最小化等价于该固定时域下的累计期望奖励最大化。真实臂均值只供评测，不进入算法输入；观察噪声不直接出现在伪遗憾定义中。FrozenPFN 的伪遗憾为 $T(m_*-m_{a_F})$，Random 的期望伪遗憾为 $T(m_*-M^{-1}\sum_a m_a)$。
+
+第~\ref{sec:pfn} 节的历史条件 PFN 在移除物理动态、取 $\gamma=1$ 后，同样适用于本场景。其参数冻结但动作分布随事实历史改变，与 FrozenPFN 的固定排序有本质区别。Bandit 处理未知收益下的信息价值，无法替代包含动作后效的 MDP 规划。
+
+\subsection{已知动态约束下的有限时域规划（Finite-Horizon Planning under Known Dynamics）}
+\label{sec:planning}
+设奖励模型 $r_m$ 与转移 $F_x$ 已知，$x$ 表示 FC 或 CD 的状态记忆。在同一候选池内，精确动态规划满足
+\begin{align}
+V_{m,0}(x)&=0,\\
+Q_{m,L}(x,a)&=r_m((L,x),a)+\gamma V_{m,L-1}(F_x(x,a)),\\
+V_{m,L}(x)&=\max_{a\in\mathcal A((L,x))}Q_{m,L}(x,a).
+\label{eq:bellman}
+\end{align}
+自 $L=1$ 至 $T$ 保存价值与最优动作即可得到有限时域策略。普通规划使用预测评分模型；实际环境真值模型的最优策略作为单独标明的信息更充分的参照。
+
+滚动时域规划在当前状态展开深度 $\min\{d,L_t\}$ 的搜索树，以零作为截断末值，仅执行首个动作，下一期重新规划。$d=1$ 对应同模型下的短视选择；当深度覆盖剩余时域时，与完整规划一致。比较时使用滚动执行完整 $T$ 期的回报，而非短搜索树的局部计划值。
+
+\paragraph{疲劳模型的可分性质。}
+对于固定基础评分 $b(\mathbf z)$ 和初始 $\mathbf f_0=\mathbf0$，FC 的总价值可重写为
+\begin{equation}
+J=\sum_{t=0}^{T-2}\gamma^t
+\left[b(\mathbf z_t)-\gamma\frac{c_f}{N}\|\mathbf z_t\|_1\right]
++\gamma^{T-1}b(\mathbf z_{T-1}).
+\label{eq:fc-separable}
+\end{equation}
+因此严格人数预算下成本对动作选择恒定，每期最大化 $b$ 的短视策略已最优。最多人数预算下，非末期最大化 $b(\mathbf z)-\gamma c_f\|\mathbf z\|_1/N$，末期最大化 $b(\mathbf z)$；深度二的滚动规划足以得到最优当前动作。FC 是验证历史成本与终端处理的可解析基准，不适合据此预设复杂长期规划的普遍优势。
+
+例如 $N=2,T=3,\gamma=1,c_f=2$，零动作与单人动作的基础评分为 $0$ 和 $0.8$。每次处理在下一期带来 $1$ 的成本，最优序列为前两期等待、末期处理，价值 $0.8$；始终短视处理的价值为 $0.4$。这些数字是手算构造，非实验结果。
+
+\paragraph{冷却带来的跨期耦合。}
+CD 中当前动作改变未来可用集合，不能按期独立最大化。取两个相邻节点、$B=2,T=3,\gamma=1$，四个动作的基础期望奖励为
+\begin{equation}
+\begin{array}{c|cccc}
+\mathbf z&(0,0)&(1,0)&(0,1)&(1,1)\\\hline
+b(\mathbf z)&0&3&3&5
+\end{array}.
+\label{eq:cd-example}
+\end{equation}
+短视策略首期同时处理两人，此后只能等待，总价值为 $5$；序列 $(1,0),(0,1),(0,0)$ 的价值为 $6$。由两期冷却可知各节点在三期内最多处理一次，枚举即可确认 $6$ 为最优值。该表可由 $m_i(z_i,e_i)=6z_i-z_ie_i$ 的网络平均生成。
+
+\paragraph{计算瓶颈。}
+CD 的记忆状态至多 $3^N$ 个，显式动态规划最多需要 $O(T3^NM)$ 次状态--动作评估，单次奖励及转移计算另计；实际可达状态可能较少。深度 $d$ 的朴素滚动搜索也可能展开 $O(M^d)$ 个节点。对大图，逐状态精确求解受到显著限制。这推动我们通过训练学习共享决策规律，将新实例上的搜索计算转移到跨任务训练阶段。
+
+\subsection{摊销 PFN 强化学习策略（Amortized PFN RL Policy）}
+\label{sec:pfn}
+\subsubsection{任务先验、事实上下文与方法定位}
+核心场景中，学习器不读取完整奖励--转移模型，而根据事实交互学习长期决策。任务 $\psi$ 包含图、节点特征、响应机制、动态类型、预算、候选池、噪声与时域。训练任务从明确指定的先验 $p_{\mathrm{train}}(\psi)$ 抽取，验证与测试按潜在任务划分，同一任务的不同轨迹不能跨划分泄漏。
+
+当前可用历史写为
+\begin{equation}
+\mathcal D_t=((q_u,a_u,R_u,q_{u+1},D_u):u<t),\qquad
+I_t=(G,X,\mathcal C,B,\kappa,q_t,\mathcal D_t),
+\label{eq:context}
+\end{equation}
+其中 $D_u$ 为终止标志。若允许携带同一任务以往回合的历史，则附带回合编号；跨任务切换时清空任务上下文。模型学习的是 $\pi_\theta(a_t\mid I_t)$，部署时固定 $\theta$，仅通过更新上下文改变动作分布。未知任务的信息不确定性由上下文近似表达，并不声称实现精确贝叶斯后验。
+
+为实现与原有方法的衔接，可增加读取静态预测表或初始事实样本的变体，但将其作为明确标记的附加信息实验。核心事实学习设置不要求先运行静态 PFN 预测器。若候选生成仍依赖静态搜索，其准备成本和依赖必须如实计入；“端到端策略”并不消除外部候选构造步骤。
+
+\subsubsection{图状态编码与 Transformer 历史融合}
+节点输入包含结构、属性和当前状态：
+\begin{equation}
+e_{i,t}^{(0)}=\operatorname{MLP}_{\mathrm{in}}
+([X_i,d_i,f_{i,t},h_{i,t},\chi_{i,t},B/N,L_t/T]).
+\end{equation}
+FC 令 $h_{i,t}=0,\chi_{i,t}=1$，CD 令 $f_{i,t}=0$，另提供动态类型及预算模式的全局标记。无动态的特例将历史状态置零。采用 GCN\citep{kipf2017} 时，令 $\widetilde A=A+I_N$，图层为
+\begin{equation}
+H_t^{(\ell+1)}=\operatorname{ReLU}
+(\widetilde D^{-1/2}\widetilde A\widetilde D^{-1/2}H_t^{(\ell)}W_\ell).
+\end{equation}
+GAT\citep{velickovic2018} 可作为替换，利用学习的邻居权重聚合消息；残差连接保留节点自身历史与可用性，池化得到网络摘要。
+
+轨迹编码器将已观察的状态、完整动作表示、聚合奖励、下一状态、终止与回合时间编码为令牌。Transformer\citep{vaswani2017} 通过因果注意力处理历史，再由当前图状态查询历史表征，输出节点表示 $u_{i,t}$ 和全局表示 $u_{g,t}$。其作用是从反馈中提取未知响应规律，并区分物理状态变化与对环境认识的变化。输入不含当前尚未观察的奖励或未来记录；上下文截断长度应作为实验因素报告。
+
+图节点不使用绑定任意编号的位置嵌入。节点重排时，图、特征、状态和候选向量同步变换。候选表示由分配内容和图结构生成，不能仅依赖候选编号；回合时间位置用于区分反馈顺序。图结构编码的等变性与自回归解码的顺序敏感性分别验证。
+
+\subsubsection{候选联合分布与动作掩码}
+主模型在与规划器相同的候选池上直接输出联合动作分布。节点基础倾向为 $p^0_{i,t}=\operatorname{sigmoid}(w^\top u_{i,t}+b)$，候选得分为
+\begin{equation}
+\ell_\theta(I_t,a)=\sum_i\left[z_i^{(a)}\log p^0_{i,t}
++(1-z_i^{(a)})\log(1-p^0_{i,t})\right]
++g_\theta(I_t,\mathbf z^{(a)}).
+\label{eq:logit}
+\end{equation}
+共享动作头 $g_\theta$ 读取处理节点池化表示、处理邻接关系、暴露结构及全局信息，使候选评分能够表达节点间联合效应，而非局限于独立节点评分。数值实现使用对数 Sigmoid。结合式~\eqref{eq:feasible} 的掩码，
+\begin{equation}
+\pi_\theta(a\mid I_t)=
+\frac{M_t(a)\exp\ell_\theta(I_t,a)}
+{\sum_{b=1}^M M_t(b)\exp\ell_\theta(I_t,b)}.
+\label{eq:masked-policy}
+\end{equation}
+在合法候选上减去最大 logit 后归一化，非法动作概率为零。节点最终入选概率为 $\sum_a\pi_\theta(a\mid I_t)z_i^{(a)}$，一般不同于基础倾向 $p^0_{i,t}$。
+
+训练时采样一个完整动作，保存其编号、向量与联合对数概率；实际执行后才接收奖励并更新状态。确定性部署选择合法候选中得分最大的动作。两种模式分别评价，均不将神经网络输出解释为已认证的全局最优解。
+
+\subsubsection{自回归分配与静态、在线特例}
+为保留结构化生成能力，另设候选前缀解码变体。给定节点顺序 $v_1,\ldots,v_N$，令
+\begin{align}
+\mathcal C_{t,j}&=\{\mathbf z^{(a)}:a\in\mathcal A(q_t),\ 
+z_{v_\ell}^{(a)}=z_{t,v_\ell}\ \forall\ell<j\},\\
+M_{t,j}(b)&=\ind\{\exists\mathbf z\in\mathcal C_{t,j}:z_{v_j}=b\},\quad b\in\{0,1\}.
+\end{align}
+逐位 masked softmax 生成分配，其完整概率为
+\begin{equation}
+\pi_\theta(\mathbf z_t\mid I_t)=\prod_{j=1}^N
+\pi_\theta(z_{t,v_j}\mid\mathbf z_{t,v_{<j}},I_t).
+\label{eq:autoregressive}
+\end{equation}
+从非空合法候选集出发，每一步保留可完成的前缀，最终必在同一候选池内。一次长度为 $N$ 的解码只对应一次环境动作，内部前缀不是新的事实交互。训练对图和动作同步随机重排，评价顺序敏感性。
+
+静态全预算空间的生成变体不受固定候选池限制。若已选人数为 $c_j$、当前位置之后剩余节点数为 $r_j=N-j$，则预算掩码为
+\begin{equation}
+M_j^{=}(b)=\ind\{0\leq B-c_j-b\leq r_j\},\qquad
+M_j^{\leq}(b)=\ind\{c_j+b\leq B\}.
+\label{eq:budget-mask}
+\end{equation}
+该变体在 $T=1$、奖励为 $\widehat V(\mathbf z)$ 时还原为离线 PFN 分配策略。无物理动态且奖励为事实反馈时，历史条件策略还原为在线 PFN Bandit 策略。全预算空间与候选空间使用不同的最优参照，不能混为同一动作范围的比较。逐位取最大概率是构造性解码，不等于求解联合概率或收益的全局最大值。
+
+\subsubsection{跨任务端到端训练}
+共享参数直接优化跨任务长期奖励：
+\begin{equation}
+J(\theta)=\E_{\psi\sim p_{\mathrm{train}}}\E_{\pi_\theta,\psi}
+\left[\sum_{t=0}^{T-1}\gamma^tR_t\right].
+\label{eq:meta-objective}
+\end{equation}
+图编码器、历史编码器与动作头由同一回报目标联合更新，无需对二元处理或多数阈值求导。优化对象是完整分配及其后续影响，不是逐节点反事实预测误差。
+
+可选的行为克隆预训练使用训练任务上的启发式或规划专家动作：
+\begin{equation}
+\mathcal L_{\mathrm{BC}}=-\E_{(I,a^{\mathrm E})\sim\mathcal D_{\mathrm E}}
+\log\pi_\theta(a^{\mathrm E}\mid I).
+\end{equation}
+自回归动作的对数概率是逐位对数概率之和。专家初始化可能改善训练起点，但专家演示属于额外信息；严格事实轨迹主实验不使用隐藏模型生成专家标签，该变体须单独报告演示来源和成本。
+
+令 $G_t=\sum_{u=t}^{T-1}\gamma^{u-t}R_u$，$v_\phi(I_t)$ 为与当前采样动作无关的价值基线。REINFORCE\citep{williams1992} 给出
+\begin{equation}
+\nabla_\theta J=\E\left[\sum_{t=0}^{T-1}\gamma^t
+(G_t-v_\phi(I_t))\nabla_\theta\log\pi_\theta(a_t\mid I_t)\right].
+\label{eq:reinforce}
+\end{equation}
+这一目标将动作对后续状态以及后续信息的影响纳入训练。价值基线只用于降低方差，不构成独立的组合优化步骤。
+
+主训练可采用 PPO\citep{schulman2017}。冻结旧策略采集事实轨迹后，在相同的历史、掩码和已执行动作上计算
+\begin{align}
+\varrho_t(\theta)&=\exp\{\log\pi_\theta(a_t\mid I_t)-\log\pi_{\theta_{\mathrm{old}}}(a_t\mid I_t)\},\\
+\mathcal L_{\mathrm{clip}}&=-\E_{\mathrm{old}}\sum_t\gamma^t
+\min\{\varrho_t\widehat A_t,
+\clip(\varrho_t,1-\epsilon,1+\epsilon)\widehat A_t\}.
+\end{align}
+采用 GAE\citep{schulman2016} 时，在同一回合内反向递推
+\begin{align}
+\delta_t&=R_t+\gamma(1-D_t)v_{\phi_{\mathrm{old}}}(I_{t+1})-v_{\phi_{\mathrm{old}}}(I_t),\\
+\widehat A_t&=\delta_t+\gamma\lambda_{\mathrm{GAE}}(1-D_t)\widehat A_{t+1},\\
+\widehat G_t&=\widehat A_t+v_{\phi_{\mathrm{old}}}(I_t).
+\end{align}
+完整回合取 $\widehat A_T=0$；真实终点不 bootstrap，因批次长度截断时使用末状态价值且不跨回合传播优势。总损失为
+\begin{equation}
+\mathcal L=\mathcal L_{\mathrm{clip}}
++c_V\E_{\mathrm{old}}\sum_t\gamma^t[v_\phi(I_t)-\sg(\widehat G_t)]^2
+-c_H\E_{\mathrm{old}}\sum_t\gamma^t\mathcal H(\pi_\theta(\cdot\mid I_t)).
+\end{equation}
+优势与价值目标停止梯度；候选分布可精确计算熵。PPO 更新不重新采样动作替换原动作的概率，也不以当前更新后的编码缓存冒充旧策略概率。主评价可取 $\gamma=1$，其他折扣下保留与目标一致的时间权重。
+
+\begin{algorithm}[htbp]
+\caption{事实交互驱动的摊销 PFN 策略训练与部署}
+\label{alg:training}
+\begin{algorithmic}[1]
+\Require 任务先验、独立验证任务、训练交互预算、公开约束接口
+\State 初始化图网络、Transformer、动作头及价值网络
+\For{每次训练迭代}
+  \State 冻结旧参数，抽取训练任务并初始化其物理状态与上下文
+  \For{任务中的每一期}
+    \State 编码当前图状态及已观察历史，按合法候选掩码采样完整动作
+    \State 执行动作，只接收其事实奖励、下一状态和终止标记
+    \State 保存输入历史、动作、反馈与旧联合对数概率，追加事实上下文
+  \EndFor
+  \State 按回合边界计算优势与价值目标，进行预定次数的 PPO 更新
+\EndFor
+\State 由验证任务选择模型并冻结共享参数
+\State 新任务中逐期前向推理、执行合法分配，并仅通过事实上下文适应
+\end{algorithmic}
+\end{algorithm}
+
+REINFORCE 和 PPO 的上述训练需要当前策略收集的新轨迹。将训练放在部署之前，不等于可以直接对任意固定历史日志进行标准 on-policy 更新。若只有不可追加交互的离线日志，需要另设离线强化学习协议并处理行为概率、动作覆盖与分布偏移；本文不把该条件下的效果作为已解决结论。
+
+\subsubsection{传统强化学习基线：Q-learning 与 Dyna-Q}
+Q-learning\citep{watkins1992} 在同样的可见状态、候选池与真实交互预算下更新
+\begin{align}
+y_t&=\begin{cases}R_t,&D_t=1,\\
+R_t+\gamma\max_{b\in\mathcal A(q_{t+1})}Q(q_{t+1},b),&D_t=0,
+\end{cases}\\
+Q(q_t,a_t)&\leftarrow Q(q_t,a_t)+\alpha[y_t-Q(q_t,a_t)].
+\end{align}
+状态必须包含剩余时域，探索与最大化均限定于合法动作。评估冻结 Q 表；未访问状态的回退规则预先固定。
+
+Dyna-Q 在每次真实更新后，以事实记录维护经验模型：访问次数 $n(q,a)$、奖励样本均值 $\widehat r(q,a)$，以及下一状态与终止标志的联合频率 $\widehat P(q',D\mid q,a)$。随后从已访问键中抽取 $K_{\mathrm D}$ 个状态--动作对，按经验模型产生额外 Q 更新。未访问条目保持未知，不从评测器复制真值或为未访问动作填入结果。$K_{\mathrm D}=0$ 且初始化及随机流相同时应还原 Q-learning；额外模型更新不算新的事实样本，但计入计算成本。
+
+表格型基线刻画逐任务学习与经验模型重用的效果，不能单独证明 PFN 架构的优势。因此增加相同图--Transformer 网络从零训练的 PPO，以及具有相同跨任务训练预算的对照，以分辨跨任务经验、网络容量和上下文推断各自的贡献。
+
+\subsubsection{推理成本与方法边界}
+候选输出头以一次网络决策代替部署时反复求解。令嵌入宽度为 $h$、图层数为 $L_g$、Transformer 层数为 $L_T$、总令牌数为 $n_{\mathrm{tok}}$，则主要计算量可写为
+\begin{equation}
+O\!\left(L_g(|\mathcal E|h+Nh^2)
++L_T(n_{\mathrm{tok}}^2h+n_{\mathrm{tok}}h^2)+M C_{\mathrm{act}}\right),
+\label{eq:complexity}
+\end{equation}
+其中 $C_{\mathrm{act}}$ 是单个候选评分成本。静态特征可缓存，动态节点状态与历史仍需更新；自回归变体另有 $N$ 步顺序解码。故“直接前向输出”不等于随图规模严格 $O(1)$。若枚举全部分配，候选规模仍可能指数增长；固定候选池通过限制动作空间控制成本，同时限制可达到的策略质量。
+
+对 $n$ 个部署任务，摊销平均成本为
+\begin{equation}
+\overline C(n)=\frac{C_{\mathrm{train}}}{n}
++\frac1n\sum_{j=1}^n(C_{\mathrm{catalog},j}+C_{\mathrm{context},j}+C_{\mathrm{decision},j}).
+\label{eq:amortized-cost}
+\end{equation}
+训练交互、专家生成、候选构造和在线推理分别报告。该框架预期在多任务重复部署中体现收益，但盈亏平衡任务数与实际加速幅度需实测。
+
+\section{实验与评估（Experiments \& Evaluation）}
+\label{sec:experiments}
+本节给出统一实验方案，所有实验配置与实测结果的空白处待补入；前述手算实例仅用于检验定义和实现。研究假设是更充分的静态搜索可能改善预测评分、在线反馈可能修正初始排序、冷却规划可能受益于前瞻，以及摊销策略可能降低新任务学习和推理成本。实际结果允许支持、部分支持或否定这些假设。
+
+\paragraph{统一条件。}
+按潜在环境独立划分训练、验证和测试；同一环境的不同预算、噪声轨迹或重排留在同一划分。所有超参数仅依据训练和验证确定。相同设置使用同一图、预算、候选池、时域和评价模型，主比较至少采用五个独立随机种子，并以独立任务为单位报告均值、离散程度及配对差异。学习评价使用独立随机流，不将评估反馈送回训练。公开模型规划器与事实学习器的信息不同，作为参照时标明差别。
+
+\begin{table}[htbp]
+\centering\small
+\caption{统一实验配置（空白处为待填写配置）。}
+\begin{tabularx}{\textwidth}{@{}L L@{}}
+\toprule 配置项 & 取值\\\midrule
+网络数据或生成机制、节点特征 & \\
+节点数、平均度、预算比例与预算模式 & \\
+响应机制、噪声及任务先验范围 & \\
+候选构造方法、候选数与多样性设置 & \\
+时域、折扣、疲劳成本与初始状态 & \\
+训练／验证／测试任务数及随机种子 & \\
+网络宽度、层数、上下文长度与训练参数 & \\
+硬件、线程、求解器时限与批量大小 & \\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+\subsection{离线求解效率对比}
+比较前期静态 PFN 加 Greedy、Local Swap、GRASP 与 MILP，并纳入 $T=1$ 的摊销 PFN 静态变体。各方法使用相同预测响应表。对有认证最优值的实例报告
+\begin{equation}
+\mathrm{Gap}_{\mathrm{pred}}=\widehat V^*-\widehat V(\mathbf z).
+\end{equation}
+只有最好已知参照时，报告相对该参照的评分差与 MILP 上界，不称其为精确最优差距。另报 $V_\mu$ 和 $V_{\mathrm{env}}$，避免把预测评分改进等同于真实收益改进。
+
+改变网络规模时同时报告平均度；比较相同时间预算下的质量，以及相同目标质量下的耗时。分别记录响应预测、候选生成、搜索、编码与解码时间，多次采样和搜索细化计入额外成本。Suo Li 的前期结果在核对网络设置、硬件和计时范围后纳入；历史数据与新实验分开注明来源。
+
+\begin{table}[htbp]
+\centering\small
+\caption{离线分配质量与效率（实测数值留空）。}
+\begin{tabularx}{\textwidth}{@{}L c c c c@{}}
+\toprule 方法 & $\widehat V$ & $V_{\mathrm{env}}$ & 预测差距 & 决策时间\\\midrule
+Greedy & & & & \\
+Greedy + Local Swap & & & & \\
+GRASP + Local Swap & & & & \\
+MILP & & & & \\
+摊销 PFN 静态策略 & & & & \\
+\bottomrule
+\end{tabularx}
+\end{table}
+\noindent 结果分析：\resultspace
+
+\subsection{在线学习的 Regret 表现}
+在无动态的固定环境中比较 Random、$\varepsilon$-greedy、UCB、FrozenPFN 和历史条件 PFN。绘制累计观测奖励与式~\eqref{eq:regret} 的累计伪遗憾，横轴为全部真实交互次数，包含初始化。改变候选数、噪声、时域和初始预测排序与真实排序的相关性，考察探索成本及有限时域收益。不得用每轮最大噪声奖励作为最优参照。
+
+\begin{table}[htbp]
+\centering\small
+\caption{固定候选池上的在线探索结果（实测数值留空）。}
+\begin{tabularx}{\textwidth}{@{}L c c c@{}}
+\toprule 方法 & 累计奖励 & 累计伪遗憾 & 单轮决策时间\\\midrule
+Random & & & \\
+$\varepsilon$-greedy & & & \\
+UCB & & & \\
+FrozenPFN & & & \\
+历史条件 PFN & & & \\
+\bottomrule
+\end{tabularx}
+\end{table}
+\noindent 伪遗憾曲线与结果分析：\resultspace
+
+\subsection{规划算法的前瞻收益验证}
+分别在 FC 与 CD 上比较短视选择、不同深度的滚动规划和精确动态规划。对于指定评分模型，报告
+\begin{equation}
+\mathrm{Gap}_{\mathrm{plan}}(\pi)=V_{\mathrm{score},T}(x_0)-J_{\mathrm{score}}(\pi).
+\end{equation}
+参照必须具有相同的候选池、起点和总时域。模型内计划价值与实际执行期望回报分列；若真实模型可精确求解，再单列实际最优差距。无精确参照的大图不填最优差距。
+
+FC 严格人数模式应验证短视与精确规划相同，最多人数模式应验证深度二的滚动执行达到精确价值。CD 通过式~\eqref{eq:cd-example} 及更复杂实例检验前瞻收益，不能预设所有网络中都存在严格优势。记录访问状态数、动作评估数、内存、搜索深度和总规划耗时，以呈现状态空间增长。
+
+\begin{table}[htbp]
+\centering\small
+\caption{有限时域规划结果（按预算和规模分别填写；实测数值留空）。}
+\begin{tabularx}{\textwidth}{@{}l L c c c@{}}
+\toprule 动态类型 & 方法 & 计划价值 & 实际回报 & 规划时间\\\midrule
+FC & 短视选择 & & & \\
+FC & 滚动规划 & & & \\
+FC & 精确动态规划 & & & \\
+CD & 短视选择 & & & \\
+CD & 滚动规划 & & & \\
+CD & 精确动态规划 & & & \\
+\bottomrule
+\end{tabularx}
+\end{table}
+\noindent 前瞻收益与可扩展性分析：\resultspace
+
+\subsection{端到端摊销 PFN 的性能评估（核心实验）}
+\subsubsection{样本效率与长期收益}
+在未知模型的 FC 与 CD 环境中，比较 Q-learning、不同 $K_{\mathrm D}$ 的 Dyna-Q、逐任务从零训练的同架构 PPO，以及共享 PFN 策略。以新任务真实交互次数为横轴，报告独立评估中的冻结参数策略回报；PFN 可以在评估回合内更新事实上下文，但不更新权重。若使用前序适应回合，其交互一并计数。
+
+记录零交互起点、不同上下文量的收益、学习曲线面积和达到预设目标回报所需交互数；目标阈值预先在验证阶段确定，未达到时报告未达到而不外推。候选数和图规模较大、表格基线不可运行时如实报告资源限制，并使用函数逼近对照。PFN 的预训练任务数、事实交互总数与训练时间另列，不能把预训练经验视作零样本成本。
+
+\begin{table}[htbp]
+\centering\small
+\caption{未知模型下的测试任务学习效率（FC 与 CD 分别填写）。}
+\begin{tabularx}{\textwidth}{@{}L c c c c@{}}
+\toprule 方法 & 长期回报 & 目标交互数 & 模型内更新数 & 非法动作数\\\midrule
+Q-learning & & & & \\
+Dyna-Q & & & & \\
+同架构 PPO（从零训练） & & & & \\
+摊销 PFN（REINFORCE） & & & & \\
+摊销 PFN（PPO） & & & & \\
+\bottomrule
+\end{tabularx}
+\end{table}
+\noindent 样本效率曲线与结果分析：\resultspace
+
+\subsubsection{推理速度与摊销收益}
+部署延迟区分单次决策与整个回合。静态策略与组合优化器比较时统一为同一个单期目标；动态策略与规划器比较时统一为同一有限时域目标，避免把单期分配与长期策略的耗时和质量混合排名。报告同硬件上的中位数与高分位延迟、批量大小、缓存状态、内存占用及质量--时间曲线。
+
+若端到端系统仍需响应预测或候选搜索，则单列并计入冷启动延迟；固定候选预计算后的速度也单列。按式~\eqref{eq:amortized-cost} 随部署任务数绘制平均成本，检验是否存在摊销收益。性能假设是部署阶段减少反复搜索，而非无条件的常数时间复杂度或必然加速。
+
+\begin{table}[htbp]
+\centering\small
+\caption{同目标下的部署成本比较（静态与动态面板分别填写）。}
+\begin{tabularx}{\textwidth}{@{}L c c c c@{}}
+\toprule 方法 & 候选准备 & 决策延迟 & 整回合耗时 & 预训练成本\\\midrule
+静态组合优化器 & & & & \\
+摊销静态策略 & & & & \\
+有限时域规划器 & & & & \\
+摊销序贯策略 & & & & \\
+\bottomrule
+\end{tabularx}
+\end{table}
+\noindent 推理速度与摊销成本分析：\resultspace
+
+\subsubsection{消融、泛化与独立核对}
+\begin{table}[htbp]
+\centering\small
+\caption{核心策略的消融与泛化实验。}
+\begin{tabularx}{\textwidth}{@{}p{.23\textwidth}L@{}}
+\toprule 因素 & 对照及研究目的\\\midrule
+图结构 & GCN、GAT 与无消息传递模型，检验拓扑信息的作用。\\
+事实上下文 & 移除历史、仅使用访问统计、不同窗口长度，区分反馈适应与固定先验。\\
+静态预测输入 & 无预测输入与附加预测表，评价先验评分的信息贡献并计入上游成本。\\
+联合动作表示 & 去掉动作交互头、候选分类与前缀解码，检验联合依赖。\\
+训练来源 & 从零训练、跨任务训练、可选专家初始化；控制训练量并标记额外信息。\\
+推理方式 & 随机采样、确定性输出、多次采样与局部细化，统一计算预算。\\
+动作覆盖 & 改变候选规模与多样性，在小图对照全部合法分配，估计候选限制的损失。\\
+分布外泛化 & 分别改变网络规模、平均度、预算、噪声、响应机制和时域。\\
+\bottomrule
+\end{tabularx}
+\end{table}
+
+小图通过独立枚举核对规划；检查 $T=1$ 的单期退化、FC 可分性质、CD 两期不可用与第三期恢复。单候选、相同臂均值和零预算时 Bandit 伪遗憾应为零。完整动作概率应归一化，表外或冷却非法动作概率应为零；全部节点不可用时选择等待。模拟器在生成噪声和推进状态之前拒绝非法动作。
+
+对经验模型以手算轨迹核对访问次数、奖励均值和转移频率；终点目标只含即时奖励，Dyna-Q 的零额外更新应复现 Q-learning。恢复训练应保持参数、经验模型、候选顺序和随机状态一致；冻结评估不得改变训练状态。学习接口的测试禁止读取隐藏奖励表，以核对“仅使用事实反馈”的条件。
+
+\noindent 消融结果、泛化结果及核对记录：\resultspace
+
+\section{结论与未来工作（Conclusion）}
+本文围绕网络干涉下的资源分配建立统一决策框架：从给定响应评分后的静态组合优化出发，引入无物理动态时的在线探索，再通过历史状态建模形成有限时域规划问题，最终提出由图神经网络、Transformer 和合法动作掩码组成的摊销 PFN 序贯策略。其核心目标是以长期回报直接训练完整分配的联合决策，在新任务中通过事实上下文适应，减少重复求解与逐任务重新训练的需求。
+
+本框架明确区分预测多数评分与实际干预收益、公开模型规划与有限反馈学习、候选集内最优与完整预算空间最优。当前一期疲劳成本具有可分结构，两期冷却约束提供更直接的跨期机会耦合。PFN 在样本效率、长期收益和部署速度上的实际优势，需要由上述实验填入结果后判断，不从模型架构或手算实例直接推出。
+
+未来工作将研究节点特异的重复干预衰减、累积疲劳与恢复、疲劳和冷却联合机制，以及跨期总预算。这些扩展需要相应增加状态并重新明确因果假设。方法层面可研究不依赖固定候选池的受约束结构化生成、稀疏历史注意力、先验错配下的稳健适应，以及只有观察性日志时的离线策略学习与评估。最终目标是在可解释的因果建模与可核验的决策质量之间，建立可扩展的网络序贯干预方法。
+
+\clearpage
+\begin{thebibliography}{99}
+\bibitem[Aronow and Samii(2017)]{aronow2017}
+Aronow P M, Samii C. Estimating average causal effects under general interference, with application to a social network experiment. \emph{The Annals of Applied Statistics}, 2017, 11(4): 1912--1947. \url{https://doi.org/10.1214/16-AOAS1005}.
+\bibitem[Müller et al.(2022)]{muller2022}
+Müller S, Hollmann N, Pineda Arango S, Grabocka J, Hutter F. Transformers can do Bayesian inference. \emph{ICLR}, 2022. \url{https://arxiv.org/abs/2112.10510}.
+\bibitem[Auer et al.(2002)]{auer2002}
+Auer P, Cesa-Bianchi N, Fischer P. Finite-time analysis of the multiarmed bandit problem. \emph{Machine Learning}, 2002, 47: 235--256. \url{https://doi.org/10.1023/A:1013689704352}.
+\bibitem[Feo and Resende(1995)]{feo1995}
+Feo T A, Resende M G C. Greedy randomized adaptive search procedures. \emph{Journal of Global Optimization}, 1995, 6. \url{https://mauricio.resende.info/doc/gtut.pdf}.
+\bibitem[Kipf and Welling(2017)]{kipf2017}
+Kipf T N, Welling M. Semi-supervised classification with graph convolutional networks. \emph{ICLR}, 2017. \url{https://arxiv.org/abs/1609.02907}.
+\bibitem[Veličković et al.(2018)]{velickovic2018}
+Veličković P, Cucurull G, Casanova A, Romero A, Liò P, Bengio Y. Graph attention networks. \emph{ICLR}, 2018. \url{https://arxiv.org/abs/1710.10903}.
+\bibitem[Vaswani et al.(2017)]{vaswani2017}
+Vaswani A, Shazeer N, Parmar N, et al. Attention is all you need. \emph{Advances in Neural Information Processing Systems}, 2017, 30. \url{https://arxiv.org/abs/1706.03762}.
+\bibitem[Williams(1992)]{williams1992}
+Williams R J. Simple statistical gradient-following algorithms for connectionist reinforcement learning. \emph{Machine Learning}, 1992, 8: 229--256. \url{https://doi.org/10.1007/BF00992696}.
+\bibitem[Schulman et al.(2017)]{schulman2017}
+Schulman J, Wolski F, Dhariwal P, Radford A, Klimov O. Proximal policy optimization algorithms. 2017. \url{https://arxiv.org/abs/1707.06347}.
+\bibitem[Schulman et al.(2016)]{schulman2016}
+Schulman J, Moritz P, Levine S, Jordan M, Abbeel P. High-dimensional continuous control using generalized advantage estimation. \emph{ICLR}, 2016. \url{https://arxiv.org/abs/1506.02438}.
+\bibitem[Watkins and Dayan(1992)]{watkins1992}
+Watkins C J C H, Dayan P. Q-learning. \emph{Machine Learning}, 1992, 8: 279--292. \url{https://doi.org/10.1007/BF00992698}.
+\end{thebibliography}
+\end{document}
