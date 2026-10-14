@@ -1,6 +1,9 @@
+已去掉标题中的“摩尔线程版”，并把“用户”相关表述改为作者/项目表述。完整 README 如下：
+
+```markdown
 # 网络干涉因果决策 PFN
 
-目标为 Linux、Python 3.10、摩尔线程 PyTorch 2.7.1 和 torch_musa 2.7.1。提供单卡及 DDP + MCCL 的八卡同步元训练。算法说明如下。
+目标为 Linux、Python 3.10、PyTorch 2.7.1 和 torch_musa 2.7.1。提供单卡及 DDP + MCCL 的八卡同步元训练。算法说明如下。
 
 发布包不包含 `runs/`、`profiles/`、`logs/` 或已训练权重。
 
@@ -200,8 +203,9 @@ python -m pytest tests -q
 
 `train_eval/train.py` 中的 `continue_tabular(checkpoint, bundle, additional_episodes, destination)` 和 `continue_scratch(checkpoint, bundle, config, additional_intervals, destination, device)` 可从完整 episode / PPO 更新边界继续。`bundle` 应通过原配置、root seed、test task index 与 dynamics 重建。检查点绑定图、特征、节点顺序、候选表、预算、时域与动态规则；环境噪声按原 episode 序号重建。PPO 的 `.context.pkl` 是配套事实历史文件，必须与 `.pt` 一起保留。仅加载可信来源的 pickle/checkpoint。
 
-本实现覆盖用户指定的固定候选主方法。主文档中的 autoregressive prefix、全空间 PFN decoder、MILP、行为克隆专家预训练，以及全套 OOD/架构消融属于额外实验，不混入默认四表。已提供 `graph_layers=0`、`history=false`、`joint_head=false`、context 长度和图类型参数用于独立配置消融；跨任务预训练预算必须另行报告。
+本实现覆盖项目指定的固定候选主方法。主文档中的 autoregressive prefix、全空间 PFN decoder、MILP、行为克隆专家预训练，以及全套 OOD/架构消融属于额外实验，不混入默认四表。已提供 `graph_layers=0`、`history=false`、`joint_head=false`、context 长度和图类型参数用于独立配置消融；跨任务预训练预算必须另行报告。
 
 默认表 2 不包含历史 PFN bandit 的额外训练对照；P4 是混合 FC/CD 预训练，不能直接把这些权重称为已训练好的无动态 bandit 策略。所有结果都应保留其目标与信息条件。
 
-用户提供的 End_to_End_PFN_Policy.tex 已原样附带。模拟中的静态随机化识别，也不自动证明观察性日志下的动态策略可识别；本实现的 P4 依赖实际执行动作后获得的事实反馈。
+End_to_End_PFN_Policy.tex 由本文档作者编写，已原样附带。模拟中的静态随机化识别，也不自动证明观察性日志下的动态策略可识别；本实现的 P4 依赖实际执行动作后获得的事实反馈。
+```
