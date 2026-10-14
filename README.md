@@ -1,6 +1,4 @@
-已按你的要求清理：删除 NVIDIA/旧依赖、旧启动脚本、历史实测与“本次优化”等迭代表述，并去掉对 `RELEASE_NOTES.md` 的引用。下面是修改后的 README.md。
-
-# 网络干涉因果决策 PFN 摩尔线程版
+# 网络干涉因果决策 PFN
 
 目标为 Linux、Python 3.10、摩尔线程 PyTorch 2.7.1 和 torch_musa 2.7.1。提供单卡及 DDP + MCCL 的八卡同步元训练。算法说明如下。
 
