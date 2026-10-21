@@ -318,62 +318,86 @@ def summarize(frame, groups, metrics):
     return aggregate.reset_index()
 
 
-def benchmark(config, output, static_model, sequential_model, targets, device):
-    output = Path(output)
-    output.mkdir(parents=True, exist_ok=True)
-    checkpoints = output / "checkpoints"
-    checkpoints.mkdir(exist_ok=True)
+def _prepare_benchmark_task(config, output, task_index):
+    prior = TaskPrior(**config["prior"])
+    with timed() as generation_time:
+        base = sample_task(prior, config["seed"], "test", task_index)
+    with timed() as estimation_time:
+        prediction_path = (str(Path(config["prediction_dir"]) / f"task_{task_index}.npz")
+                           if config.get("prediction_dir") else None)
+        prediction = prediction_for(base, config["estimation_rounds"],
+                                    task_seed(config["seed"], "test", task_index, 1), prediction_path)
+    # Both catalog variants must be recoverable: with_setting('CD') rebuilds
+    # the CD-aware catalog, while FC/NONE share the non-CD exposure design.
+    cd_catalog = base.with_setting('CD', prior.horizon).public.catalog
+    np.savez_compressed(output / f"task_{task_index}.npz", adjacency=base.public.adjacency,
+                        features=base.public.features, catalog=base.public.catalog,
+                        catalog_cd=cd_catalog, mu_hat=prediction,
+                        node_ids=np.arange(prior.n))
+    with timed() as cache_time:
+        StaticScore(base.public.adjacency, prediction).catalog_values(base.public.catalog)
+        preparation_env = base.env(task_seed(config["seed"], "test", task_index, 9))
+        preparation_env.reset()
+    setup = {"task": task_index, "task_id": base.task_id,
+                  "generation_catalog_seconds": generation_time["seconds"],
+                  "prediction_seconds": estimation_time["seconds"],
+                  "score_and_env_cache_seconds": cache_time["seconds"],
+                  "static_experimental_assignments": 0 if prediction_path else config["estimation_rounds"],
+                  "prediction_source": "external" if prediction_path else "factual Ridge example",
+                  "mean_degree": float(base.public.adjacency.sum(1).mean())}
+    return base, prediction, setup
+
+
+def _evaluate_benchmark_job(config, checkpoints, static_model, sequential_model,
+                            targets, device, base, prediction, task_index, replicate):
     prior, settings = TaskPrior(**config["prior"]), config["evaluation"]
     tables = {k: [] for k in range(1, 5)}
-    bandit_traces, learning_curves, eval_traces, setup = [], [], [], []
-    for task_index in range(settings["test_tasks"]):
-        with timed() as generation_time:
-            base = sample_task(prior, config["seed"], "test", task_index)
-        with timed() as estimation_time:
-            prediction_path = (str(Path(config["prediction_dir"]) / f"task_{task_index}.npz")
-                               if config.get("prediction_dir") else None)
-            prediction = prediction_for(base, config["estimation_rounds"],
-                                        task_seed(config["seed"], "test", task_index, 1), prediction_path)
-        np.savez_compressed(output / f"task_{task_index}.npz", adjacency=base.public.adjacency,
-                            features=base.public.features, catalog=base.public.catalog, mu_hat=prediction,
-                            node_ids=np.arange(prior.n))
-        with timed() as cache_time:
-            StaticScore(base.public.adjacency, prediction).catalog_values(base.public.catalog)
-            preparation_env = base.env(task_seed(config["seed"], "test", task_index, 9))
-            preparation_env.reset()
-        setup.append({"task": task_index, "task_id": base.task_id,
-                      "generation_catalog_seconds": generation_time["seconds"],
-                      "prediction_seconds": estimation_time["seconds"],
-                      "score_and_env_cache_seconds": cache_time["seconds"],
-                      "static_experimental_assignments": 0 if prediction_path else config["estimation_rounds"],
-                      "prediction_source": "external" if prediction_path else "factual Ridge example",
-                      "mean_degree": float(base.public.adjacency.sum(1).mean())})
-        for replicate in settings["seeds"]:
-            tags = {"task": task_index, "seed": replicate}
-            noise_seed = episode_seed(config["seed"], "test", task_index, replicate, 0, 700)
-            static = base.with_setting("NONE", 1)
-            tables[1].extend([{**r, **tags} for r in offline_table(
-                static, prediction, static_model, noise_seed, device, config["grasp_restarts"])])
-            bandit = base.with_setting("NONE", settings["bandit_rounds"])
-            rows, traces = bandit_table(bandit, prediction, config, noise_seed)
-            tables[2].extend([{**r, **tags} for r in rows])
-            bandit_traces.extend([{**r, **tags} for r in traces])
-            for dynamics in ("FC", "CD"):
-                dynamic = base.with_setting(dynamics, prior.horizon)
-                tables[3].extend([{**r, **tags} for r in planning_table(dynamic, prediction, config, noise_seed)])
-                rows, curves, traces = learning_table(dynamic, sequential_model, config, targets[dynamics],
-                                                      task_index, replicate, device, checkpoints)
-                tables[4].extend([{**r, **tags} for r in rows])
-                learning_curves.extend([{**r, **tags} for r in curves])
-                eval_traces.extend([{**r, **tags} for r in traces])
-            # Save progress at the boundary of each independent replicate.
-            for number, rows in tables.items():
-                pd.DataFrame(rows).to_csv(output / f"table{number}_raw.csv", index=False)
-            pd.DataFrame(bandit_traces).to_csv(output / "bandit_traces.csv", index=False)
-            pd.DataFrame(learning_curves).to_csv(output / "learning_curves.csv", index=False)
-            pd.DataFrame(eval_traces).to_csv(output / "evaluation_episodes.csv", index=False)
-            print(f"Benchmark complete: task={task_index}, seed={replicate}", flush=True)
-    pd.DataFrame(setup).to_csv(output / "preparation_costs.csv", index=False)
+    bandit_traces, learning_curves, eval_traces = [], [], []
+    tags = {"task": task_index, "seed": replicate}
+    noise_seed = episode_seed(config["seed"], "test", task_index, replicate, 0, 700)
+    static = base.with_setting("NONE", 1)
+    tables[1].extend([{**r, **tags} for r in offline_table(
+        static, prediction, static_model, noise_seed, device, config["grasp_restarts"])])
+    bandit = base.with_setting("NONE", settings["bandit_rounds"])
+    rows, traces = bandit_table(bandit, prediction, config, noise_seed)
+    tables[2].extend([{**r, **tags} for r in rows])
+    bandit_traces.extend([{**r, **tags} for r in traces])
+    for dynamics in ("FC", "CD"):
+        dynamic = base.with_setting(dynamics, prior.horizon)
+        tables[3].extend([{**r, **tags} for r in planning_table(dynamic, prediction, config, noise_seed)])
+        rows, curves, traces = learning_table(dynamic, sequential_model, config, targets[dynamics],
+                                              task_index, replicate, device, checkpoints)
+        tables[4].extend([{**r, **tags} for r in rows])
+        learning_curves.extend([{**r, **tags} for r in curves])
+        eval_traces.extend([{**r, **tags} for r in traces])
+    return dict(tables=tables, bandit_traces=bandit_traces,
+                learning_curves=learning_curves, eval_traces=eval_traces)
+
+
+def _write_benchmark_progress(output, completed):
+    """Only the parent writes aggregate CSVs, in original task/seed order."""
+    tables = {k: [] for k in range(1, 5)}
+    traces = {name: [] for name in ('bandit_traces', 'learning_curves', 'eval_traces')}
+    for job_id in sorted(completed):
+        result = completed[job_id]
+        for number in tables:
+            tables[number].extend(result['tables'][number])
+        for name in traces:
+            traces[name].extend(result[name])
+    frames = {f'table{number}_raw.csv': pd.DataFrame(rows) for number, rows in tables.items()}
+    for name, filename in [('bandit_traces', 'bandit_traces.csv'),
+                           ('learning_curves', 'learning_curves.csv'),
+                           ('eval_traces', 'evaluation_episodes.csv')]:
+        frames[filename] = pd.DataFrame(traces[name])
+    for filename, frame in frames.items():
+        destination = Path(output) / filename
+        temporary = destination.with_suffix('.csv.tmp')
+        frame.to_csv(temporary, index=False)
+        temporary.replace(destination)
+    return tables
+
+
+def _summarize_benchmark(output, tables):
     specs = {
         1: (["method"], ["predicted_value", "V_env", "V_mu", "decision_seconds", "predicted_gap"]),
         2: (["method"], ["pseudo_regret", "decision_seconds_per_round", "cumulative_reward"]),
@@ -394,17 +418,160 @@ def benchmark(config, output, static_model, sequential_model, targets, device):
     paired.to_csv(output / "paired_return_differences.csv")
 
 
-def plot_curves(frame, x, y, title, path):
+
+def _benchmark_serial(config, output, static_model, sequential_model, targets, device):
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    checkpoints = output / 'checkpoints'
+    checkpoints.mkdir(exist_ok=True)
+    completed, setup = {}, []
+    settings = config['evaluation']
+    for task_index in range(settings['test_tasks']):
+        base, prediction, preparation = _prepare_benchmark_task(config, output, task_index)
+        setup.append(preparation)
+        for replicate in settings['seeds']:
+            completed[len(completed)] = _evaluate_benchmark_job(
+                config, checkpoints, static_model, sequential_model, targets, device,
+                base, prediction, task_index, replicate)
+            tables = _write_benchmark_progress(output, completed)
+            print(f'Benchmark complete: task={task_index}, seed={replicate}', flush=True)
+    pd.DataFrame(setup).to_csv(output / 'preparation_costs.csv', index=False)
+    _summarize_benchmark(output, tables)
+
+
+def _uniform_random_reference(bundle, gamma, seed, trajectories=3000):
+    """Evaluator-side expected return of uniform legal actions (MC estimate).
+
+    The sampled actions respect FC/CD state masks. Only the expected rewards
+    are used, so no observation-noise sampling is mixed into the reference.
+    No learned policy or third-party baseline is executed here.
+    """
+    from ..env.core import transition, valid_mask
+
+    rng = np.random.default_rng(seed)
+    task = bundle.public
+    evaluator = Evaluator(bundle)
+    total = 0.0
+    for _ in range(trajectories):
+        state, value, discount = initial_key(task), 0.0, 1.0
+        while state[0] > 0:
+            valid = np.flatnonzero(valid_mask(task, state))
+            action = int(valid[rng.integers(len(valid))])
+            value += discount * evaluator.mean_reward(state, action)
+            discount *= gamma
+            state = transition(task, state, action)
+        total += value
+    return total / trajectories
+
+
+def _learning_normalization(results, learning):
+    """Use per-test-task random and exact-oracle references for ALL methods.
+
+    Random=0 and task-specific exact optimal return=1. References are used
+    only to visualize completed evaluations, never to change model decisions.
+    If an exact oracle is unavailable, fail instead of silently substituting
+    an approximate method or computing a misleading normalized variance.
+    """
+    import json
+
+    results = Path(results)
+    config = json.loads((results / "config.json").read_text(encoding="utf-8"))
+    planning = pd.read_csv(results / "table3_raw.csv")
+    required = {"dynamics", "task", "method", "status", "planned_value"}
+    if required - set(planning.columns):
+        raise ValueError("table3_raw.csv lacks fields: " + str(sorted(required - set(planning.columns))))
+    exact = planning.loc[(planning["method"] == "Oracle Exact DP") &
+                         (planning["status"] == "complete"),
+                         ["dynamics", "task", "planned_value"]].copy()
+    if exact.empty:
+        raise ValueError("No completed Oracle Exact DP references in table3_raw.csv")
+    # Multiple seeds for the same task should produce exactly the same
+    # noise-free optimal value; catch an inconsistent input before plotting.
+    grouped = exact.groupby(["dynamics", "task"])["planned_value"]
+    spread = grouped.max() - grouped.min()
+    if (spread > 1e-5).any():
+        raise ValueError("Oracle Exact DP values differ across seeds for the same task")
+    oracle = grouped.mean().to_dict()
+
+    prior = TaskPrior(**config["prior"])
+    root = int(config["seed"])
+    gamma = float(config["ppo"]["gamma"])
+    expected = set(map(tuple, learning[["dynamics", "task"]].drop_duplicates().to_numpy()))
+    missing = sorted(expected - set(oracle))
+    if missing:
+        raise ValueError("Cannot normalize without completed Oracle Exact DP for: " +
+                         str(missing) + ". Check table3_raw.csv and planning limits.")
+
+    references = []
+    for dynamics, task_index in sorted(expected):
+        task_index = int(task_index)
+        bundle = sample_task(prior, root, "test", task_index, dynamics)
+        # Benchmark writes task_<id>.npz. Check the regenerated public task to
+        # prevent silently normalizing against a different environment prior.
+        task_path = results / f"task_{task_index}.npz"
+        if task_path.exists():
+            with np.load(task_path) as saved:
+                catalog_key = 'catalog_cd' if dynamics == 'CD' else 'catalog'
+                if catalog_key not in saved.files:
+                    raise ValueError(f'{task_path} is missing {catalog_key}; cannot safely '
+                                     'reconstruct a dynamics-specific normalization baseline')
+                for name, live in (("adjacency", bundle.public.adjacency),
+                                   ("features", bundle.public.features),
+                                   (catalog_key, bundle.public.catalog)):
+                    if not np.array_equal(saved[name], live):
+                        raise ValueError(f"{task_path} differs in {name}; cannot safely "
+                                         "reconstruct the normalization baseline")
+        baseline = _uniform_random_reference(
+            bundle, gamma, task_seed(root, "test", task_index, 901))
+        optimum = float(oracle[(dynamics, task_index)])
+        if not np.isfinite(baseline) or not np.isfinite(optimum) or optimum - baseline <= 1e-6:
+            raise ValueError(f"Invalid normalization range for {dynamics} task {task_index}: "
+                             f"random={baseline}, oracle={optimum}")
+        references.append({"dynamics": dynamics, "task": task_index,
+                           "random_reference": baseline, "oracle_reference": optimum})
+    return pd.DataFrame(references)
+
+
+def plot_curves(frame, x, y, title, path, normalization=None):
+    """Plot mean +/- sample SD across tasks (seed replicates averaged first).
+
+    For FC/CD, first normalize each task's return with its own random and
+    oracle reference, then compute across-task statistics. Do not pool raw
+    task reward scales. The original unnormalized bandit chart is unchanged.
+    """
     import matplotlib.pyplot as plt
+
+    if normalization is not None:
+        keys = ["dynamics", "task"]
+        frame = frame.merge(normalization, on=keys, how="left", validate="many_to_one")
+        if frame[["random_reference", "oracle_reference"]].isna().any().any():
+            raise ValueError("Normalization references missing for learning curve rows")
+        scale = frame["oracle_reference"] - frame["random_reference"]
+        if (scale <= 1e-6).any():
+            raise ValueError("Invalid oracle-random range in normalization references")
+        # Same transform for every method in the same task; no clipping.
+        frame = frame.assign(_normalized_return=(frame[y] - frame["random_reference"]) / scale)
+        value = "_normalized_return"
+    else:
+        value = y
 
     fig, ax = plt.subplots(figsize=(7, 4.2), constrained_layout=True)
     for method, group in frame.groupby("method"):
-        per_task = group.groupby(["task", x])[y].mean().unstack(0)
-        average, std = per_task.mean(1), per_task.std(1).fillna(0)
+        per_task = group.groupby(["task", x])[value].mean().unstack(0).sort_index()
+        if normalization is not None and per_task.isna().any().any():
+            raise ValueError(f"Incomplete task/interactions coverage for {method}")
+        average, std = per_task.mean(axis=1), per_task.std(axis=1).fillna(0)
         ax.plot(average.index, average, label=method)
         ax.fill_between(average.index.to_numpy(), (average - std).to_numpy(),
                         (average + std).to_numpy(), alpha=0.15)
-    ax.set(xlabel="Factual interactions", ylabel=y.replace("_", " "), title=title)
+    if normalization is None:
+        ax.set(xlabel="Factual interactions", ylabel=y.replace("_", " "), title=title)
+    else:
+        ax.set(xlabel="Factual interactions",
+               ylabel="Normalized return (random=0, exact oracle=1)",
+               title=title + " (task-normalized)")
+        ax.axhline(0, color="0.4", linestyle=":", linewidth=0.7, alpha=0.5)
+        ax.axhline(1, color="0.4", linestyle=":", linewidth=0.7, alpha=0.5)
     ax.legend(fontsize=8)
     ax.grid(alpha=0.2)
     fig.savefig(path, dpi=180)
@@ -412,12 +579,226 @@ def plot_curves(frame, x, y, title, path):
 
 
 def plot_results(results):
-    """Draw existing CSV results without rerunning any experiment."""
+    """Redraw the original PNG filenames from saved results (no training)."""
     results = Path(results)
     bandit = pd.read_csv(results / "bandit_traces.csv")
+    learning = pd.read_csv(results / "learning_curves.csv")
+    normalization = _learning_normalization(results, learning)
+    # This figure plots the independent bandit experiment, not the learned PFN.
+    # Retain its original absolute pseudo-regret units and behavior.
     plot_curves(bandit, "round", "pseudo_regret", "Catalog-restricted bandit regret",
                 results / "bandit_regret.png")
-    learning = pd.read_csv(results / "learning_curves.csv")
     for dynamics, group in learning.groupby("dynamics"):
-        plot_curves(group, "interactions", "long_term_return", f"{dynamics}: frozen-policy evaluation",
-                    results / f"learning_{dynamics}.png")
+        plot_curves(group, "interactions", "long_term_return",
+                    f"{dynamics}: frozen-policy evaluation",
+                    results / f"learning_{dynamics}.png", normalization=normalization)
+
+
+# Single-file compatibility with the unchanged train_eval.run entry point.
+import argparse
+import io
+import multiprocessing as mp
+import os
+import sys
+from concurrent.futures import ProcessPoolExecutor, wait, FIRST_COMPLETED
+from contextlib import ExitStack
+from ..runtime import resolve_device
+
+
+def _read_evaluation_cli():
+    main = sys.modules.get('__main__')
+    spec = getattr(main, '__spec__', None)
+    if (getattr(spec, 'name', None) != 'pfn_network.train_eval.run'
+            or mp.current_process().name != 'MainProcess'):
+        return None, None
+    # Consume only the two new flags. All original/unknown flags remain for run.py.
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    def positive(value):
+        number = int(value)
+        if number < 1:
+            raise argparse.ArgumentTypeError('must be a positive integer')
+        return number
+    parser.add_argument('--eval-workers', type=positive)
+    parser.add_argument('--eval-threads', type=positive)
+    options, remaining = parser.parse_known_args(sys.argv[1:])
+    if '-h' in remaining or '--help' in remaining:
+        print('Additional evaluation options:')
+        print('  --eval-workers N  One process per MUSA card (default: remaining visible cards; CPU: 1)')
+        print('  --eval-threads N  CPU threads per evaluation process (parallel default: 1)')
+    sys.argv[1:] = remaining
+    return options.eval_workers, options.eval_threads
+
+
+_CLI_WORKERS, _CLI_THREADS = _read_evaluation_cli()
+
+
+def evaluation_devices(device, workers=None):
+    if workers is not None and workers < 1:
+        raise ValueError('--eval-workers must be positive')
+    resolved = resolve_device(device)
+    if resolved.type == 'cpu':
+        return ['cpu'] * (workers if workers is not None else 1)
+    start = resolved.index or 0
+    available = torch.musa.device_count() - start
+    workers = available if workers is None else workers
+    if workers > available:
+        raise ValueError('--eval-workers exceeds available MUSA devices from the selected device; use one worker per card')
+    return [f'musa:{index}' for index in range(start, start + workers)]
+
+
+def _model_payload(model):
+    buffer = io.BytesIO()
+    torch.save(dict(model_config=asdict(model.config),
+                    model={key: value.detach().cpu() for key, value in model.state_dict().items()},
+                    extra={}), buffer)
+    return buffer.getvalue()
+
+
+def benchmark(config, output, static_model, sequential_model, targets, device,
+              *, eval_workers=None, eval_threads=None):
+    """Preserve the original six arguments; parallelize independent task/seed jobs."""
+    workers = eval_workers if eval_workers is not None else _CLI_WORKERS
+    threads = eval_threads if eval_threads is not None else _CLI_THREADS
+    devices = evaluation_devices(device, workers)
+    settings = config['evaluation']
+    total_jobs = settings['test_tasks'] * len(settings['seeds'])
+    if settings['test_tasks'] < 1 or total_jobs < 1:
+        raise ValueError('Evaluation needs positive test_tasks and nonempty seeds')
+    if len(settings['seeds']) != len(set(settings['seeds'])):
+        raise ValueError('Evaluation seeds must be unique to prevent checkpoint collisions')
+    # Validate the requested card count first, then avoid starting idle workers.
+    devices = devices[:total_jobs]
+    workers = len(devices)
+    if threads is not None and threads < 1:
+        raise ValueError('--eval-threads must be positive')
+    if workers == 1:
+        if threads is None:
+            return _benchmark_serial(config, output, static_model, sequential_model, targets, device)
+        from threadpoolctl import threadpool_limits
+        previous = torch.get_num_threads()
+        try:
+            torch.set_num_threads(threads)
+            with threadpool_limits(limits=threads):
+                return _benchmark_serial(config, output, static_model, sequential_model, targets, device)
+        finally:
+            torch.set_num_threads(previous)
+    return benchmark_parallel(config, output, _model_payload(static_model),
+                              _model_payload(sequential_model), targets, devices, threads or 1)
+
+
+_WORKER = None
+
+
+def _initialize_worker(config, static_payload, sequential_payload, targets, device, threads, checkpoints):
+    global _WORKER
+    # Spawned evaluators must never join an inherited training DDP process group.
+    for key in ('RANK', 'WORLD_SIZE', 'LOCAL_RANK', 'LOCAL_WORLD_SIZE', 'GROUP_RANK',
+                'ROLE_RANK', 'ROLE_WORLD_SIZE'):
+        os.environ.pop(key, None)
+    os.environ['OMP_NUM_THREADS'] = str(threads)
+    os.environ['MKL_NUM_THREADS'] = str(threads)
+    torch.set_num_threads(threads)
+    torch.set_num_interop_threads(1)
+    from threadpoolctl import threadpool_limits
+    limiter = threadpool_limits(limits=threads)
+    device = str(resolve_device(device))
+    static, _ = PFNPolicy.load(io.BytesIO(static_payload), device)
+    sequential, _ = PFNPolicy.load(io.BytesIO(sequential_payload), device)
+    static.requires_grad_(False)
+    sequential.requires_grad_(False)
+    _WORKER = dict(config=config, static=static, sequential=sequential, targets=targets,
+                   device=device, checkpoints=Path(checkpoints), limiter=limiter)
+
+
+def _run_job(base, prediction, task_index, replicate):
+    w = _WORKER
+    print(f"Benchmark start: task={task_index}, seed={replicate}, "
+          f"device={w['device']}, pid={os.getpid()}", flush=True)
+    result = _evaluate_benchmark_job(w['config'], w['checkpoints'], w['static'], w['sequential'],
+                                     w['targets'], w['device'], base, prediction, task_index, replicate)
+    return result, os.getpid()
+
+
+def benchmark_parallel(config, output, static_payload, sequential_payload, targets, devices, threads=1):
+    """Bound in-flight work to one job per worker; only parent writes table CSVs."""
+    settings = config['evaluation']
+    seeds = settings['seeds']
+    if settings['test_tasks'] < 1 or not seeds:
+        raise ValueError('Parallel evaluation needs positive test_tasks and nonempty seeds')
+    if len(seeds) != len(set(seeds)):
+        raise ValueError('Evaluation seeds must be unique to prevent checkpoint collisions')
+    if threads < 1 or not devices:
+        raise ValueError('Evaluation threads and number of devices must be positive')
+    # Also validate direct API calls, not only the command-line entry point.
+    if len(set(devices)) != len(devices) and devices != ['cpu'] * len(devices):
+        raise ValueError('Each accelerator worker requires a distinct device')
+    output = Path(output).resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    checkpoints = output / 'checkpoints'
+    checkpoints.mkdir(exist_ok=True)
+    completed, preparation, tasks = {}, [], {}
+    jobs = [(task, seed) for task in range(settings['test_tasks']) for seed in seeds]
+    devices = devices[:len(jobs)]
+    status = dict(mode='independent task/seed spawn workers', devices=devices,
+                  threads_per_worker=threads, total_jobs=len(jobs), completed=[], status='running')
+
+    def save_status():
+        path = output / 'evaluation_parallel.json'
+        temporary = path.with_suffix('.json.tmp')
+        write_json(temporary, status)
+        temporary.replace(path)
+
+    save_status()
+    try:
+        for task in range(settings['test_tasks']):
+            base, prediction, row = _prepare_benchmark_task(config, output, task)
+            tasks[task] = (base, prediction)
+            preparation.append(row)
+        pd.DataFrame(preparation).to_csv(output / 'preparation_costs.csv', index=False)
+        print(f'Parallel evaluation: {len(devices)} workers, {len(jobs)} task/seed jobs, '
+              f'devices={devices}', flush=True)
+        context = mp.get_context('spawn')
+        pending = {}
+        next_job = 0
+        with ExitStack() as stack:
+            pools = [stack.enter_context(ProcessPoolExecutor(
+                max_workers=1, mp_context=context, initializer=_initialize_worker,
+                initargs=(config, static_payload, sequential_payload,
+                          targets, device, threads, str(checkpoints)))) for device in devices]
+
+            def submit(worker, job_id):
+                task, seed = jobs[job_id]
+                base, prediction = tasks[task]
+                future = pools[worker].submit(_run_job, base, prediction, task, seed)
+                pending[future] = (worker, job_id)
+
+            for worker in range(len(pools)):
+                submit(worker, next_job)
+                next_job += 1
+            while pending:
+                ready, _ = wait(pending, return_when=FIRST_COMPLETED)
+                for future in ready:
+                    worker, job_id = pending.pop(future)
+                    task, seed = jobs[job_id]
+                    try:
+                        result, pid = future.result()
+                    except Exception as error:
+                        status['failed_job'] = dict(task=task, seed=seed, device=devices[worker])
+                        raise RuntimeError(f'Evaluation failed: task={task}, seed={seed}, '
+                                           f'device={devices[worker]}') from error
+                    completed[job_id] = result
+                    tables = _write_benchmark_progress(output, completed)
+                    status['completed'].append(dict(task=task, seed=seed, device=devices[worker], pid=pid))
+                    save_status()
+                    print(f'Benchmark complete: task={task}, seed={seed}, device={devices[worker]} '
+                          f'[{len(completed)}/{len(jobs)}]', flush=True)
+                    if next_job < len(jobs):
+                        submit(worker, next_job)
+                        next_job += 1
+        _summarize_benchmark(output, tables)
+    except BaseException as error:
+        status.update(status='failed', error=f'{type(error).__name__}: {error}')
+        save_status()
+        raise
+    status['status'] = 'complete'
+    save_status()

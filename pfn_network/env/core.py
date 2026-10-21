@@ -57,6 +57,25 @@ class PublicTask:
         for array in (a, self.features, c):
             array.setflags(write=False)
 
+        # ------------------ 方案 A：针对 Zen 4 SIMD 预计算 ------------------
+        if n <= 64:
+            # 预计算每个动作的 64 位无符号整型掩码 (C-contiguous，命中 L1 Cache)
+            powers = (1 << np.arange(n, dtype=np.uint64))
+            catalog_bits = (c.astype(np.uint64) * powers).sum(axis=1, dtype=np.uint64)
+            catalog_bits.setflags(write=False)
+            object.__setattr__(self, "_catalog_bits", catalog_bits)
+        else:
+            object.__setattr__(self, "_catalog_bits", None)
+
+        # 预计算激活节点下标与动作元组，加速 transition
+        object.__setattr__(self, "_action_active_nodes", tuple(
+            tuple(int(idx) for idx in np.flatnonzero(c[i])) for i in range(len(c))
+        ))
+        object.__setattr__(self, "_catalog_tuples", tuple(
+            tuple(int(x) for x in row) for row in c
+        ))
+        # -------------------------------------------------------------------
+
     @property
     def n(self):
         return len(self.features)
@@ -79,25 +98,71 @@ def initial_key(task: PublicTask) -> StateKey:
     return task.horizon, (0,) * task.n
 
 
-def valid_mask(task: PublicTask, key: StateKey):
+def valid_mask(task: PublicTask, key: StateKey, out: np.ndarray | None = None) -> np.ndarray:
     remaining, memory = key
     if remaining == 0:
+        if out is not None:
+            out.fill(False)
+            return out
         return np.zeros(task.m, dtype=bool)
+
     if task.dynamics == Dynamics.CD:
-        return ~np.any(task.catalog & (np.asarray(memory) > 0), axis=1)
+        # 快速短路：若没有任何节点处于冷却中，全动作直接合法
+        if not any(memory):
+            if out is not None:
+                out.fill(True)
+                return out
+            return np.ones(task.m, dtype=bool)
+
+        catalog_bits = getattr(task, "_catalog_bits", None)
+        if catalog_bits is not None:
+            # 将 memory 中的冷却状态转化为一个 64 位整型掩码
+            busy_mask = 0
+            for i, m in enumerate(memory):
+                if m:
+                    busy_mask |= (1 << i)
+
+            # AMD Zen 4 下硬件 SIMD 向量化位运算：单周期高通量吞吐
+            if out is not None:
+                np.equal(catalog_bits & np.uint64(busy_mask), 0, out=out)
+                return out
+            return (catalog_bits & np.uint64(busy_mask)) == 0
+
+        # 回退通用路径
+        res = ~np.any(task.catalog & (np.asarray(memory) > 0), axis=1)
+        if out is not None:
+            np.copyto(out, res)
+            return out
+        return res
+
+    if out is not None:
+        out.fill(True)
+        return out
     return np.ones(task.m, dtype=bool)
 
 
 def transition(task: PublicTask, key: StateKey, action: int) -> StateKey:
     remaining, memory = key
-    z = task.catalog[action]
+    action = int(action)
+
     if task.dynamics == Dynamics.FC:
-        new_memory = z
+        catalog_tuples = getattr(task, "_catalog_tuples", None)
+        new_memory = catalog_tuples[action] if catalog_tuples is not None else tuple(int(x) for x in task.catalog[action])
     elif task.dynamics == Dynamics.CD:
-        new_memory = np.where(z, 2, np.maximum(np.asarray(memory) - 1, 0))
+        active_nodes = getattr(task, "_action_active_nodes", None)
+        if active_nodes is not None:
+            # 状态步进规则：未选中的 2->1, 1->0, 0->0；选中的置为 2
+            mem = [1 if m == 2 else 0 for m in memory]
+            for node in active_nodes[action]:
+                mem[node] = 2
+            new_memory = tuple(mem)
+        else:
+            z = task.catalog[action]
+            new_memory = tuple(2 if z_i else (m_i - 1 if m_i > 0 else 0) for z_i, m_i in zip(z, memory))
     else:
-        new_memory = np.zeros(task.n, dtype=np.int8)
-    return remaining - 1, tuple(int(x) for x in new_memory)
+        new_memory = (0,) * task.n
+
+    return remaining - 1, new_memory
 
 
 def fatigue_penalty(task: PublicTask, key: StateKey):
@@ -126,6 +191,7 @@ class NetworkEnv:
         self._key = initial_key(task)
         self._observation_buffer = None
         self._public_prepared = False
+        self._mask = np.ones(task.m, dtype=bool)
 
     def reset(self, seed: int | None = None):
         self.invalid_attempts = 0
@@ -139,7 +205,8 @@ class NetworkEnv:
             self._public_prepared = True
         self.__base_rewards = self.__source.prepare(self.task, self._exact)
         self._key = initial_key(self.task)
-        self._mask = valid_mask(self.task, self._key)
+        # 原来是: self._mask = valid_mask(self.task, self._key)
+        self._mask = valid_mask(self.task, self._key, out=self._mask)
         for array in (self._exact, self._majority, self._edge_index):
             array.setflags(write=False)
         # Public features are constant within an episode; observations own copies.
@@ -198,7 +265,7 @@ class NetworkEnv:
         reward = float(self.__base_rewards[action_id] - fatigue_penalty(self.task, self._key)
                        + self.__source.sample_noise(self.__rng, self.task.n))
         self._key = transition(self.task, self._key, int(action_id))
-        self._mask = valid_mask(self.task, self._key)
+        self._mask = valid_mask(self.task, self._key, out=self._mask)
         done = self._key[0] == 0
         return self._observation(), reward, done, False, {}
 

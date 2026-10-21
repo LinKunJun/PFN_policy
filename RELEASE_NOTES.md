@@ -64,3 +64,48 @@ Unique 两处优化和 `PFN_SKIP_ZERO_PAD=1`、已验证的其他加速开关。
 依赖文件、README 和论文说明；不包含训练 `runs/`、`profiles/`、`logs/`、
 旧源码备份、pycache、一次性 A/B 安装器或大型 Trace 文件。
 解压到新的独立目录，避免覆盖正在运行的旧工程。
+
+
+## GNN inference content IDs — 2026-10-14
+
+Frozen inference now interns exact graph/state/global content keys to integer IDs. Content equality, stable deduplication and LRU order are preserved; writable/non-owning inputs still re-read bytes. IDs remain scope-local and monotonic, metadata is bounded, and model/PPO/checkpoint mathematics are unchanged.
+
+Validation: original pytest and exact CPU fingerprint; MUSA actions, rollout outputs, PPO metrics, RNG and boundary cases exact. Only empirically noisy floating fields use min(4 × five-original-run noise, 2e-5); stable fields remain exact. Candidate pytest and single-GPU/one-CPU-thread update passed.
+
+Eight-rank sequential A/B: three full updates per source, 4 CPU threads/rank, 16 environment workers/rank; median 87.9647s → 81.4110s (7.45% faster), all three paired wins. Each update has 245,760 interactions and 480 PPO optimizer steps; measured training time excludes final validation/checkpoint work.
+
+Experiment and backups: `runs/patch_gnn_keycache_resume_20261014_195826_483431/`. Model source SHA256: `49a47378af268c8ce4e0496d5fa862d22596b9215b6dc4ca960687347370ec1d`.
+
+
+## GNN cache-hit CPU key plan - 2026-10-14
+
+The normal inference bank checks its existing identity memo directly for plain owning read-only NumPy arrays, verifying both weakrefs and re-reading flags on each lookup. Misses, writable/non-owning inputs and subclasses use the existing content-key routine. Local bindings and dictionary setdefault preserve first occurrence order while reducing Python calls. GPU operations, model/PPO definitions, LRU eviction, capacity guards and content-ID semantics are unchanged.
+
+Validation: 28,736-state key/representative/gather checks, mutation/view/subclass/weakref checks, exact CPU rollout/PPO/Adam/RNG/restore fingerprint, pytest, and one full 8-rank sequential update.
+
+One uninstrumented update: 79.1137s; previously confirmed best 81.2873s, training time reduced 2.67%. Same 8 ranks, 4 CPU threads/rank, 16 environment workers/rank, 245,760 interactions and 480 PPO steps. This is a single new measurement, compared against the recorded prior best.
+
+Experiment/backups: `runs/patch_bank_hit_20261014_214851_510368/`. Model SHA256: `90c2ce45a71202ac859ed949d63e120fc30448ba3b418f6a0506bcb4fe235192`.
+
+
+## History index arrays - 2026-10-14
+
+Keep before/after history IDs as contiguous int64 NumPy arrays. Concatenate per-task slices instead of boxing every index into Python lists and converting those lists back to arrays/tensors in the model. Stable first-occurrence order, ring windows, padding, state registration, GPU gather values and model/PPO calculations are unchanged.
+
+Validation: exact full-sized 24,576-record packing and downstream index bytes; empty/mixed histories, ring wrap/rebuild, irregular nodes and fallback; exact CPU rollout/PPO/Adam/RNG/restore fingerprint; MUSA index conversion/gather; pytest; one full eight-rank sequential update.
+
+One uninstrumented update: 76.1171s; previously confirmed best 79.1137s, training time reduced 3.79%. Same 8 ranks, 4 CPU threads/rank, 16 environment workers/rank, 245,760 interactions and 480 PPO steps. This is a single new measurement compared against the recorded prior best.
+
+Experiment/backups: `runs/patch_history_indices_20261014_234824_514874/`. History source SHA256: `56938e63faf6ce702cbc2ccaad34ca01d7ec07341131635fa62dd295d4f528c8`.
+Model source SHA256: `90c2ce45a71202ac859ed949d63e120fc30448ba3b418f6a0506bcb4fe235192`.
+
+
+## Incremental rollout content-key planning - 2026-10-15
+
+Resolve content IDs once for new collector-owned, owning, read-only snapshots. Gather prior IDs by history-registry indices and preserve first occurrence representatives with NumPy. Generic mutable/view inputs retain the original checks. Scope changes and content-table pruning invalidate plans. GNN bank allocation, LRU, GPU operations, PPO and CPU action RNG are unchanged.
+
+Validation: actual-source CPU plan/pack/slot equivalence, full 64x384 histories, pruning/capacity/shape/fallback/scope tests; exact CPU rollout/PPO/Adam/RNG/restore fingerprint with confirmed incremental-path coverage; pytest; one full 8-rank update.
+
+One update: 60.1049s vs recorded 76.1171s; time reduction 21.04%. 8 ranks, 4 CPU threads/rank, 16 environment workers/rank, 245760 interactions and 480 PPO steps. One candidate measurement.
+
+Experiment/backups: `runs/patch_incremental_keys_20261015_112602_551247/`. Source hashes: {'pfn': {'path': 'pfn_network/models/pfn.py', 'old': '90c2ce45a71202ac859ed949d63e120fc30448ba3b418f6a0506bcb4fe235192', 'new': 'a3a27c94f20a495c3c5f0274688a9a0f425b00ac5cd9955ce9d9406e78b39157'}, 'history': {'path': 'pfn_network/models/incremental_history.py', 'old': '56938e63faf6ce702cbc2ccaad34ca01d7ec07341131635fa62dd295d4f528c8', 'new': '216a1b31ced72bc82392e2f7df8e2ac92fd3d99bfb88b9034a4b760a24541073'}, 'train': {'path': 'pfn_network/train_eval/train.py', 'old': 'b8900440535820aa1e03ed66a35fca95fcab9b7a429e8dc2e4f31bc06afbc6fd', 'new': '5c985a9e9b75fbefbe7ffde33d299fff988e1f688522a78f514c9d4e29c50a9a'}}

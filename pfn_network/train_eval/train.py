@@ -83,6 +83,9 @@ def _sealed_rollout_observations(model):
     so training data and tensor conversion behavior remain unchanged.
     """
     sealed = []
+    previous_snapshots = getattr(model, '_sealed_rollout_snapshots', None)
+    snapshots = {}
+    model._sealed_rollout_snapshots = snapshots
 
     def seal(observation):
         for name in ('pfn_state', 'global_state'):
@@ -90,12 +93,22 @@ def _sealed_rollout_observations(model):
             if isinstance(value, np.ndarray) and value.flags.owndata and value.flags.writeable:
                 value.setflags(write=False)
                 sealed.append(value)
+        state, glob = observation['pfn_state'], observation['global_state']
+        if (type(state) is np.ndarray and type(glob) is np.ndarray
+                and state.flags.owndata and glob.flags.owndata
+                and not state.flags.writeable and not glob.flags.writeable):
+            # Strong references prevent ID recycling. Views/subclasses are not
+            # admitted; generic callers retain the checked content-key path.
+            snapshots[(id(state), id(glob))] = (state, glob)
     try:
         yield seal
     finally:
         # Exception-safe: normal callers and PPO get writable snapshots back.
-        for value in sealed:
-            value.setflags(write=True)
+        try:
+            for value in sealed:
+                value.setflags(write=True)
+        finally:
+            model._sealed_rollout_snapshots = previous_snapshots
 
 
 def write_json(path, value):

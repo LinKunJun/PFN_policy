@@ -1,0 +1,3 @@
+本版DGP是mab-n。而不是随机catalog
+本版为并行化evaluate评测，evaluate.py现在是并行实现
+本版的pfn.py是计算图融合之后的，pfn.py.bak是备份，是原始的实现

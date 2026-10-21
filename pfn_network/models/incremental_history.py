@@ -107,6 +107,10 @@ class IncrementalHistoryCache:
         self.states = []
         self.globals = []
         self.graph_keys = []
+        self._bank_plan_context = None
+        self._bank_plan_size = 0
+        self._bank_plan_keys = np.empty(0, dtype=np.int64)
+        self._bank_plan_nodes = np.empty(0, dtype=np.int64)
         self.stats = {'appended': 0, 'rebuilt': 0, 'rebuild_records': 0,
                       'calls': 0, 'record_rows': 0}
 
@@ -122,6 +126,53 @@ class IncrementalHistoryCache:
         self.globals.append(global_state)
         self.graph_keys.append(graph_key)
         return value
+
+    def bank_plan(self, registry_ids, content_key, content_epoch, snapshots):
+        """Resolve only newly registered, collector-owned immutable snapshots.
+
+        Object-ID dedup in pack() and content dedup in the GNN bank are distinct.
+        Keep both, including first occurrence order. A content-table prune or
+        a different sealing scope invalidates the ID table. Untrusted inputs
+        cannot skip the original per-forward array/weakref checks.
+        """
+        if content_epoch is None or snapshots is None:
+            return None
+        context = self._bank_plan_context
+        if context is None or context[0] is not content_epoch or context[1] is not snapshots:
+            self._bank_plan_context = (content_epoch, snapshots)
+            self._bank_plan_size = 0
+        size = len(self.states)
+        if size > len(self._bank_plan_keys):
+            capacity = max(size, 64, 2 * len(self._bank_plan_keys))
+            keys = np.empty(capacity, dtype=np.int64)
+            nodes = np.empty(capacity, dtype=np.int64)
+            prefix = self._bank_plan_size
+            keys[:prefix] = self._bank_plan_keys[:prefix]
+            nodes[:prefix] = self._bank_plan_nodes[:prefix]
+            self._bank_plan_keys, self._bank_plan_nodes = keys, nodes
+        for i in range(self._bank_plan_size, size):
+            state, glob = self.states[i], self.globals[i]
+            trusted = snapshots.get((id(state), id(glob)))
+            if (trusted is not None and trusted[0] is state and trusted[1] is glob
+                    and type(state) is np.ndarray and type(glob) is np.ndarray
+                    and state.flags.owndata and glob.flags.owndata
+                    and not state.flags.writeable and not glob.flags.writeable):
+                self._bank_plan_keys[i] = content_key(state, glob, self.graph_keys[i])
+                self._bank_plan_nodes[i] = len(state)
+            else:
+                self._bank_plan_keys[i] = -1
+                self._bank_plan_nodes[i] = -1
+        self._bank_plan_size = size
+        keys = self._bank_plan_keys[registry_ids]
+        nodes = self._bank_plan_nodes[registry_ids]
+        if not len(keys) or np.any(keys < 0) or nodes[0] <= 0 or np.any(nodes != nodes[0]):
+            return None
+        # Vectorized first-occurrence content dedup replaces the Python scan.
+        unique, first = np.unique(keys, return_index=True)
+        order = np.argsort(first)
+        representatives = dict(zip(unique[order].tolist(), first[order].tolist()))
+        return {'keys': keys.tolist(), 'first': representatives,
+                'nodes': int(nodes[0]), 'epoch': content_epoch}
 
     def pack(self, observations, histories, episodes, task_ids, static, slots, max_n):
         """Return same order/values as _forward_many history preparation.
@@ -198,18 +249,24 @@ class IncrementalHistoryCache:
         for size in lengths:
             sub = local[offset:offset + 1 + 2 * size]
             current.append(int(sub[0]))
-            before.extend(sub[1::2])
-            after.extend(sub[2::2])
+            # Keep index slices as int64 arrays through the model gathers.
+            # Iterating them into lists boxes every history index in Python,
+            # only for the caller to convert those lists back to arrays.
+            before.append(sub[1::2])
+            after.append(sub[2::2])
             offset += 1 + 2 * size
         static_ids = {entry['key']: row for row, entry in enumerate(static)}
         gids = local_to_stable.tolist()
         self.stats['calls'] += 1
         self.stats['record_rows'] += sum(lengths)
         return {
+            'registry_ids': local_to_stable,
             'states': [self.states[x] for x in gids],
             'globals': [self.globals[x] for x in gids],
             'graph_slots': [static_ids[self.graph_keys[x]] for x in gids],
-            'current': current, 'before': before, 'after': after,
+            'current': current,
+            'before': np.concatenate(before),
+            'after': np.concatenate(after),
             'allocations': (np.concatenate(alloc_rows, axis=0) if alloc_rows else
                             np.zeros((0, max_n), dtype=np.float32)),
             'exposures': (np.concatenate(exposure_rows, axis=0) if exposure_rows else

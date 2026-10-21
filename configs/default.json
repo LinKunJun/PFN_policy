@@ -1,10 +1,10 @@
 {
   "seed": 20261011,
   "prior": {
-    "n": 30,
+    "n": 60,
     "feature_dim": 4,
     "budget": 8,
-    "catalog_size": 48,
+    "catalog_size": 256,
     "horizon": 6,
     "graph_family": "mixed",
     "edge_probability": 0.15,
@@ -33,9 +33,9 @@
     "max_grad_norm": 0.5
   },
   "meta": {
-    "updates": 300,
+    "updates": 150,
     "tasks_per_update": 512,
-    "episodes_per_task": 80,
+    "episodes_per_task": 200,
     "validate_every": 50,
     "validation_tasks": 10
   },
