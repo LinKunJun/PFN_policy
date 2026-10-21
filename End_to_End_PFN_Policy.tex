@@ -1,13 +1,16 @@
+% !TeX program = xelatex
 % Standalone manuscript: references are embedded; no external .bib file required.
-% Empirical results and experiment-specific configurations are intentionally blank.
-\documentclass[UTF8,a4paper,11pt,fontset=fandol]{ctexart}
+% Experimental results completed from pretrain_20261016_214631_651627.
+% Compile with XeLaTeX twice from the directory containing this file and figures/.
+\documentclass[a4paper,11pt]{article}
 \usepackage[margin=24mm]{geometry}
+\usepackage{fontspec}
+\usepackage{graphicx,placeins}
 \usepackage{amsmath,amssymb,mathtools,booktabs,tabularx,array}
 \usepackage{algorithm,algpseudocode,enumitem}
 \usepackage[numbers,sort&compress]{natbib}
 \usepackage{xcolor,xurl,hyperref,bookmark}
-\ctexset{section={format=\Large\bfseries},subsection={format=\large\bfseries},subsubsection={format=\normalsize\bfseries}}
-\hypersetup{colorlinks=true,linkcolor=blue!45!black,citecolor=blue!45!black,urlcolor=blue!45!black,pdftitle={网络干涉下的因果决策框架：从静态分配到摊销序贯强化学习}}
+\hypersetup{colorlinks=true,linkcolor=blue!45!black,citecolor=blue!45!black,urlcolor=blue!45!black,pdftitle={A Causal Decision Framework under Network Interference: From Static Allocation to Amortized Sequential Reinforcement Learning}}
 \urlstyle{same}
 \setlength{\emergencystretch}{3em}
 \setlength{\parskip}{3pt}
@@ -19,585 +22,695 @@
 \newcommand{\ind}{\mathbf 1}
 \newcommand{\sg}{\operatorname{sg}}
 \newcommand{\clip}{\operatorname{clip}}
-\newcommand{\blank}{\underline{\hspace{1.5cm}}}
-\newcommand{\resultspace}{\par\vspace{1.0cm}}
 \numberwithin{equation}{section}
-\floatname{algorithm}{算法}
-\algrenewcommand{\algorithmicrequire}{\textbf{输入：}}
-\algrenewcommand{\algorithmicensure}{\textbf{输出：}}
-\title{网络干涉下的因果决策框架：\\从静态分配到摊销序贯强化学习}
+\floatname{algorithm}{Algorithm}
+\algrenewcommand{\algorithmicrequire}{\textbf{Input:}}
+\algrenewcommand{\algorithmicensure}{\textbf{Output:}}
+\title{PFN policy under Sequential Interference}
 \author{}
 \date{}
 \begin{document}
 \maketitle
 
-\begin{abstract}
-社交网络中的干预分配同时受到网络溢出、资源预算与历史依赖的影响。已有的静态 PFN 预测与组合优化方法先估计处理--暴露响应面，再搜索单期分配，难以直接处理重复干预中的未来成本、冷却约束与未知环境适应。本文建立一个递进式网络干涉决策框架，依次研究离线静态组合优化、固定候选池上的在线探索、已知动态模型下的有限时域规划，以及事实交互驱动的摊销 PFN 序贯策略。核心方法融合图神经网络与 Transformer，将网络结构、当前状态和历史轨迹映射为合法完整分配的联合概率，并通过策略梯度跨任务训练，以长期回报直接优化决策。本文统一定义多数暴露评分、实际干预收益、预算与动态边际价值，保留候选集限制和因果识别的适用条件，给出可复现的基线、理论核对实例与实验评价方案。实验分别考察求解质量、候选集内伪遗憾、规划前瞻收益、测试任务样本效率和部署延迟；实证结果留待实验完成后填入。
-\end{abstract}
-\noindent\textbf{关键词：}网络干涉；因果决策；PFN；马尔可夫决策过程；摊销强化学习；动作掩码
 
-\section{引言（Introduction）}
-在社交网络中分配学习提醒、信息推送或其他有限资源时，个体结果不仅取决于自身是否接受干预，还取决于邻居的干预情况。例如，对一名学生发送提醒可能通过同伴交流影响未接受提醒的学生。网络干涉使资源分配成为联合决策：同一节点的选择会改变多个个体的暴露，逐个节点排序通常不足以得到高收益名单。暴露映射、分配设计与因果目标之间的关系构成此类问题的建模基础\citep{aronow2017}。
-
-之前的工作采用静态的“先预测，后优化”（Predict-then-Optimize）范式：先由先验数据拟合网络（Prior-Data Fitted Network, PFN）估计四个处理--多数暴露响应均值，再由贪心或其他组合优化方法选择名单。该工作提供了响应预测接口与静态决策基础。本文在此基础上扩展决策问题；前期实验的具体数值将在统一核对数据与评价口径后补入实验部分。
-
-在重复干预与未知环境下，静态范式需要进一步考虑以下两方面问题。一方面，网络多数阈值可能产生联合收益，单步贪心可能遗漏协同分配，而更充分的组合搜索会增加逐实例计算开销。另一方面，重复干预会影响后续收益与可用性：今天的处理可能使明天产生疲劳成本，或使节点在随后两期无法再次接受处理。当前收益最高的名单因此未必具有最高的长期价值。此外，环境响应未知时，动作还承担收集信息的作用，决策需要兼顾探索和利用。
-
-本文将这些问题组织为四个相互衔接的决策场景，而非假设所有场景具有相同的信息条件：
-\begin{enumerate}
-  \item \textbf{离线静态求解。}以固定响应评分为目标，通过局部交换、多起点搜索与精确参照研究联合分配质量和计算成本。
-  \item \textbf{在线自适应探索。}在无物理状态转移的环境中，将完整分配作为 Bandit 臂，以事实奖励修正候选方案的收益排序。
-  \item \textbf{已知动态模型规划。}引入一期疲劳成本和两期冷却约束，用精确动态规划与滚动规划刻画前瞻价值及状态空间限制。
-  \item \textbf{摊销 PFN 序贯策略。}以图网络与 Transformer 编码状态和轨迹，通过强化学习跨任务训练共享策略，在新任务中利用上下文直接产生合法分配。这是本文的核心方法。
-\end{enumerate}
-
-PFN 的原始思想是从任务先验中抽取数据，训练共享网络实现新任务上的上下文推断\citep{muller2022}。本文将这一思想拓展为以长期回报为目标的策略学习：训练阶段承担跨任务学习成本，部署阶段冻结参数，依据可见状态与事实历史决策。这里的“端到端”指策略参数由分配产生的回报直接优化，部署时直接输出决策，而不必先重建完整响应面再调用逐实例优化器；这并不意味着自动获得全局最优性、因果识别保证或任意分布下的泛化保证。本文提出的方法设计与待验证的性能假设，将通过统一实验分别检验。
-
-\section{问题建模（Problem Formulation）}
-\subsection{静态网络干涉模型}
+\section{Problem Formulation}
+\subsection{Static Network Interference Model}
 \label{sec:static-model}
-设处理前固定无向图为 $G=(\mathcal V,\mathcal E,A)$，节点数为 $N$，$A$ 是对称二元邻接矩阵且 $A_{ii}=0$。节点特征为 $X_i$，邻居集合为 $\mathcal N(i)$，度为 $d_i=\sum_j A_{ij}$。给定完整分配 $\mathbf z\in\{0,1\}^N$，定义
+Let $G=(\mathcal V,\mathcal E,A)$ be a fixed, undirected pretreatment graph with $N$ nodes, where $A$ is a symmetric binary adjacency matrix and $A_{ii}=0$. Node $i$ has features $X_i$, neighborhood $\mathcal N(i)$, and degree $d_i=\sum_j A_{ij}$. For a complete allocation $\mathbf z\in\{0,1\}^N$, define
 \begin{align}
 K_i(\mathbf z)&=\sum_j A_{ij}z_j,
 &E_i(\mathbf z)&=K_i(\mathbf z)/d_i,\\
 S_i(\mathbf z)&=\ind\{K_i(\mathbf z)>\lfloor d_i/2\rfloor\}.
 \end{align}
-$S_i$ 表示严格多数暴露，恰有一半邻居接受处理时取零。主设定取 $d_i>0$；若研究孤立节点，规定其 $E_i=S_i=0$，不对没有支持的多数暴露类别估计因果均值。
+The indicator $S_i$ represents strict-majority exposure and equals zero when exactly half of the neighbors are treated. The main setting assumes $d_i>0$. For isolated nodes, we set $E_i=S_i=0$ and do not estimate causal means for majority-exposure categories without support.
 
-\paragraph{设计标准化响应面。}
-为避免处理变量与总时域混淆，记初始随机实验分配为 $\mathbf W$，其中 $W_i\overset{\mathrm{iid}}{\sim}\mathrm{Bernoulli}(1/2)$。节点层面的四臂响应面为
+\paragraph{Design-standardized response surfaces.}
+To distinguish treatment indicators from the total horizon, denote the initial randomized experimental assignment by $\mathbf W$, where $W_i\overset{\mathrm{iid}}{\sim}\mathrm{Bernoulli}(1/2)$. The four treatment--exposure means for each node are
 \begin{equation}
 \mu_i(a,s)=\E\!\left[Y_i((a,\mathbf W_{-i}))
 \mid S_i((a,\mathbf W_{-i}))=s,G,X\right],\qquad a,s\in\{0,1\}.
 \label{eq:mu}
 \end{equation}
-在一致性、完整处理向量随机化与 $\Pr(W_i=a,S_i=s\mid G,X)>0$ 下，该目标等于相应可观测条件均值。响应面允许节点异质性，统一写为 $\mu_i(a,s)$。条件均值的总体识别并不意味着一张网络上的单次观测足以逐节点精确估计四个均值；PFN 预测还依赖跨节点、跨任务的建模与先验。
+Under consistency, randomization of the complete treatment vector, and $\Pr(W_i=a,S_i=s\mid G,X)>0$, this target equals the corresponding observable conditional mean. The notation $\mu_i(a,s)$ permits node-level heterogeneity. Population identification of these conditional means does not imply that a single observation on one network can precisely estimate all four means for each node. PFN prediction additionally relies on modeling and priors across nodes and tasks.
 
-设静态 PFN 给出的估计为 $\widehat\mu_i(a,s)$。预测评分、真实多数评分与固定分配的实际期望收益分别定义为
+Let $\widehat\mu_i(a,s)$ denote an estimated response table, supplied by a static PFN in the original static pipeline. The predicted score, the true majority-exposure score, and the actual expected reward of a fixed allocation are, respectively,
 \begin{align}
 \widehat V(\mathbf z)&=\frac1N\sum_i\widehat\mu_i(z_i,S_i(\mathbf z)),\\
 V_\mu(\mathbf z)&=\frac1N\sum_i\mu_i(z_i,S_i(\mathbf z)),\\
 V_{\mathrm{env},\psi}(\mathbf z)&=\frac1N\sum_i m_{i,\psi}(z_i,E_i(\mathbf z)).
 \label{eq:three-values}
 \end{align}
-这里 $m_{i,\psi}(a,e)$ 是任务 $\psi$ 中精确邻居暴露下的响应均值，采用精确暴露充分描述静态响应的模拟设定。式~\eqref{eq:mu} 对同一多数类别中的完整分配进行设计平均，因此即使 $\widehat\mu=\mu$，一般也不能推出 $V_\mu=V_{\mathrm{env},\psi}$。将多数暴露视为充分响应映射需要额外假设。实验据此分开评估预测目标优化质量和实际收益。
+Here, $m_{i,\psi}(a,e)$ is the response mean under exact neighborhood exposure in task $\psi$. The simulation model assumes that exact exposure sufficiently describes the static response. Equation~\eqref{eq:mu} averages over complete assignments within a majority-exposure category under the experimental design. Consequently, even $\widehat\mu=\mu$ does not generally imply $V_\mu=V_{\mathrm{env},\psi}$. Treating majority exposure as a sufficient response mapping requires additional assumptions. We therefore evaluate optimization of the predicted objective and actual rewards separately.
 
-\paragraph{预算与分配。}
-令 $B\in\{0,\ldots,N\}$ 为人数预算，定义
+\paragraph{Budgets and allocations.}
+Let $B\in\{0,\ldots,N\}$ be a treatment-count budget. Define
 \begin{equation}
 \mathcal Z_B^{=} =\{\mathbf z:\|\mathbf z\|_1=B\},\qquad
 \mathcal Z_B^{\leq}=\{\mathbf z:\|\mathbf z\|_1\leq B\},\qquad
 \mathbf z\in\{0,1\}^N.
 \label{eq:budget}
 \end{equation}
-记预算模式为 $\kappa\in\{=,\leq\}$，静态目标是
-$\max_{\mathbf z\in\mathcal Z_B^\kappa}\widehat V(\mathbf z)$。
-向量 $(0,1,0,0,1,\ldots)$ 表示第 2、5 个节点接受处理，向量位置对应节点，不是干预时刻。
+Write the budget mode as $\kappa\in\{=,\leq\}$. The static objective is
+$\max_{\mathbf z\in\mathcal Z_B^\kappa}\widehat V(\mathbf z)$.
+The vector $(0,1,0,0,1,\ldots)$ assigns treatment to nodes 2 and 5. Vector positions index nodes rather than intervention times.
 
-单节点添加的静态边际评分为
+The static marginal score of adding a single node is
 \begin{equation}
 \Delta_j(\mathbf z)=\widehat V(\mathbf z+\mathbf e_j)-\widehat V(\mathbf z),\qquad z_j=0.
 \label{eq:static-marginal}
 \end{equation}
-其变化包含节点 $j$ 自身响应以及邻居暴露变化。严格人数预算下，比较最终可行分配应采用一进一出的交换边际，而不能将不满足预算的添加视为最终可行动作。
+This change includes node $j$'s own response and changes in its neighbors' exposures. Under an exact-count budget, comparisons between final feasible allocations use the marginal value of a one-for-one swap; an addition that violates the budget is not a feasible final action.
 
-\subsection{序贯决策扩展（MDP Formulation）}
+\subsection{Sequential Decision Extension: MDP Formulation}
 \label{sec:mdp}
-令 $t=0,\ldots,T-1$，剩余期数为 $L_t=T-t$，折扣因子为 $0<\gamma\leq1$。每期执行完整分配 $\mathbf z_t$，整条分配轨迹为 $Z=(\mathbf z_0,\ldots,\mathbf z_{T-1})$。策略根据当前信息逐期产生向量，通常不是在初始时刻一次性承诺整条开环轨迹。预算 $B$ 每期重置，不是跨期递减的资源总量。
+Let $t=0,\ldots,T-1$, with remaining horizon $L_t=T-t$ and discount factor $0<\gamma\leq1$. A complete allocation $\mathbf z_t$ is executed in each period, producing the allocation trajectory $Z=(\mathbf z_0,\ldots,\mathbf z_{T-1})$. A policy generates allocations period by period from current information, rather than generally committing to an entire open-loop trajectory at the outset. The budget $B$ resets each period; it is not a total resource stock depleted across periods.
 
-\paragraph{一期疲劳成本（Fatigue Cost, FC）。}
-记上一期分配为 $\mathbf f_t$，初始 $\mathbf f_0=\mathbf0$。状态与转移为
+\paragraph{One-period fatigue cost.}
+Let $\mathbf f_t$ denote the previous period's allocation, with $\mathbf f_0=\mathbf0$. The state and transition are
 \begin{equation}
 q_t=(L_t,\mathbf f_t),\qquad
 \mathbf f_{t+1}=\mathbf z_t,\qquad L_{t+1}=L_t-1.
 \end{equation}
-令 $R_t^{\mathrm{base}}=N^{-1}\sum_iY_{i,t}(\mathbf z_t)$，则
+Let $R_t^{\mathrm{base}}=N^{-1}\sum_iY_{i,t}(\mathbf z_t)$. The reward is
 \begin{equation}
-R_t^{\mathrm{FC}}=R_t^{\mathrm{base}}-\frac{c_f}{N}\|\mathbf f_t\|_1,\qquad c_f\geq0.
-\label{eq:fc}
+R_t^{\text{fatigue cost}}=R_t^{\mathrm{base}}-\frac{c_f}{N}\|\mathbf f_t\|_1,\qquad c_f\geq0.
+\label{eq:fatigue-cost}
 \end{equation}
-该定义保留原有模型的一期历史成本：上一期处理人数只在当前期产生一次成本，不自动降低同一节点再次处理的效果，也不限制其再次被选。FC 可采用两种人数预算。终点之后不额外计入历史成本。
+This definition retains the one-period history cost of the original model: the number treated in the previous period incurs a cost once in the current period. It does not automatically reduce the effect of retreating the same node or restrict that node's selection. The fatigue cost setting supports both budget modes. No additional history cost is charged after the terminal time.
 
-\paragraph{两期冷却约束（Cooldown, CD）。}
-令 $h_{i,t}\in\{0,1,2\}$ 为节点剩余等待期数，初始为零，可用性为 $\chi_{i,t}=\ind\{h_{i,t}=0\}$。状态为 $q_t=(L_t,\mathbf h_t)$，采用最多人数预算，并要求 $z_{i,t}\leq\chi_{i,t}$。转移为
+\paragraph{Two-period cooldown constraint.}
+Let $h_{i,t}\in\{0,1,2\}$ be the number of remaining waiting periods for node $i$, initially zero, and let $\chi_{i,t}=\ind\{h_{i,t}=0\}$ indicate availability. The state is $q_t=(L_t,\mathbf h_t)$. This setting uses an at-most-count budget and requires $z_{i,t}\leq\chi_{i,t}$. The transition is
 \begin{equation}
 h_{i,t+1}=\begin{cases}
 2,&z_{i,t}=1,\\
 \max\{h_{i,t}-1,0\},&z_{i,t}=0,
 \end{cases}
-\qquad R_t^{\mathrm{CD}}=R_t^{\mathrm{base}}.
-\label{eq:cd}
+\qquad R_t^{\text{cooldown}}=R_t^{\mathrm{base}}.
+\label{eq:cooldown}
 \end{equation}
-第 $t$ 期处理后，第 $t+1,t+2$ 期不能再次处理，第 $t+3$ 期恢复。邻居不会因该节点被处理而自动进入冷却。CD 不叠加 FC 成本；只保存二元可用性不足以区分还需等待一期或两期的状态。
+After treatment in period $t$, a node cannot be treated in periods $t+1$ and $t+2$ and becomes available again in period $t+3$. Its neighbors do not automatically enter cooldown. The cooldown setting does not add a fatigue cost. A binary availability indicator alone cannot distinguish nodes that must wait one more period from those that must wait two.
 
-\paragraph{固定候选池与合法动作。}
-为使探索、规划与策略学习能够在同一动作空间比较，定义互异且非空的候选池
+\paragraph{Fixed action catalog and feasible actions.}
+To compare exploration, planning, and policy learning in the same action space, define a nonempty catalog of distinct allocations,
 \begin{equation}
 \mathcal C=\{\mathbf z^{(1)},\ldots,\mathbf z^{(M)}\}\subseteq\mathcal Z_B^\kappa.
 \label{eq:catalog}
 \end{equation}
-动作编号 $a_t\in\{1,\ldots,M\}$ 对应 $\mathbf z_t=\mathbf z^{(a_t)}$。FC 的合法集合为全部候选；CD 为
+Action index $a_t\in\{1,\ldots,M\}$ corresponds to $\mathbf z_t=\mathbf z^{(a_t)}$. All candidates are feasible in the fatigue cost setting. In the cooldown setting,
 \begin{equation}
 \mathcal A(q_t)=\{a:\ z_i^{(a)}\leq\chi_{i,t}\ \forall i\},\qquad
 M_t(a)=\ind\{a\in\mathcal A(q_t)\}.
 \label{eq:feasible}
 \end{equation}
-CD 候选池包含全零分配，从而始终允许等待。静态高评分候选并不一定覆盖动态最优序列；候选构造还应覆盖不同人数和节点组合。候选集合、节点顺序和编号在单次运行中固定，最优性参照均明确限定于该动作空间。
+The cooldown catalog includes the all-zero allocation, so waiting is always possible. Candidates with high static scores need not cover the dynamically optimal sequence; catalog construction should also cover different treatment counts and node combinations. The catalog, node order, and action indices remain fixed during a run. Optimality references are explicitly restricted to this action space.
 
-\paragraph{信息条件、因果解释与价值目标。}
-固定任务 $\psi$ 下，奖励和下一状态只依赖当前状态与动作，形成有限时域 MDP；终端 $L=0$ 的价值为零。模型已知时，规划器读取指定奖励 $r_m$ 和转移 $F$。其中 $m=\mathrm{score}$ 使用 $\widehat V$ 与上述动态规则，$m=\mathrm{env}$ 使用实际条件期望，两者分别定义
+\paragraph{Information conditions, causal interpretation, and value objectives.}
+Within a fixed task $\psi$, the reward and next state depend only on the current state and action, yielding a finite-horizon MDP with zero value at the terminal horizon $L=0$. When the model is known, the planner receives a specified reward $r_m$ and transition $F$. The model $m=\mathrm{score}$ combines $\widehat V$ with the dynamics above, whereas $m=\mathrm{env}$ uses actual conditional expected rewards. Their values are
 \begin{equation}
 J_{\psi,m}(\pi)=\E_\pi\!\left[\sum_{t=0}^{T-1}\gamma^t r_m(q_t,a_t)\right].
 \end{equation}
-交互学习以事实回报为目标：
+Interaction-based learning instead targets factual return:
 \begin{equation}
 J_\psi(\pi)=\E_{\pi,\psi}\!\left[\sum_{t=0}^{T-1}\gamma^tR_t\right].
 \label{eq:return}
 \end{equation}
-未知任务中的学习器只看到当前状态、合法动作以及已执行动作的事实记录。预算和冷却可用性是公开约束；“模型未知”指不向学习器提供可查询的完整奖励--转移模型，不意味着连合法动作也不可观测。任务参数未知时，物理状态仍是固定任务下的马尔可夫状态，但历史还提供关于任务的知识，策略输入应包含上下文。
+On an unknown task, the learner observes only the current state, feasible actions, and factual records of executed actions. Budgets and cooldown availability are public constraints. An ``unknown model'' means that a complete, queryable reward--transition model is not supplied to the learner; feasible actions remain observable. When task parameters are unknown, the physical state is still Markovian within the fixed task, while history provides additional task information and should be included in the policy context.
 
-静态随机化识别并不能自动识别动态干预效果；将静态评分叠加人工动态规则，仅定义一个规划模型。若从观察性日志推断序贯策略价值，还需一致性、给定历史的序贯可交换性和相关完整动作的正支持，以及足够的状态记录。本文的主要学习协议允许训练时进行实际或模拟交互，反馈仅来自已执行动作，不把未选动作的潜在结果交给学习器。
+Identification under static randomization does not automatically identify dynamic intervention effects. Combining a static score with artificial dynamic rules defines a planning model. Inferring sequential policy value from observational logs additionally requires consistency, sequential exchangeability conditional on history, positive support for the relevant complete actions, and sufficiently informative state records. Our main learning protocol permits real or simulated interaction during training. Feedback is restricted to executed actions, and potential outcomes for unselected actions are not supplied to the learner.
 
-定义 $Q_{m,L}^\pi(x,a)$ 为状态记忆 $x$、剩余 $L$ 期时先执行 $a$、此后遵循 $\pi$ 的期望回报。动态边际价值为
+Let $Q_{m,L}^\pi(x,a)$ denote expected return when starting from memory state $x$ with $L$ periods remaining, executing action $a$, and following $\pi$ thereafter. Define the dynamic marginal value as
 \begin{equation}
 \Delta_{m,L}^\pi(x;a',a)=Q_{m,L}^\pi(x,a')-Q_{m,L}^\pi(x,a),\qquad
 a,a'\in\mathcal A((L,x)).
 \label{eq:dynamic-marginal}
 \end{equation}
-它同时包括即时直接与溢出收益、未来疲劳成本以及冷却导致的机会变化，不能由固定的个体处理效应替代。
+It includes immediate direct and spillover rewards, future fatigue cost, and changes in opportunities caused by cooldown. A fixed individual treatment effect cannot substitute for this quantity.
 
-\section{递进式网络决策框架（Progressive Decision Framework）}
-\subsection{离线静态策略的组合优化（Offline Static Optimization）}
+\section{Progressive Decision Framework}
+\subsection{Offline Static Optimization}
 \label{sec:offline}
-本场景假定供决策使用的响应表已经给定，且动作不改变未来状态。若响应面为估计值，算法求解的是预测目标而非已知真实收益。严格预算的搜索空间有 $\binom NB$ 个分配，最多预算有 $\sum_{b=0}^B\binom Nb$ 个分配。
+In this setting, the response table used for decision-making is given, and actions do not change future states. When the response surface is estimated, the algorithm optimizes a predicted objective rather than known actual rewards. The exact-count search space contains $\binom NB$ allocations; the at-most-count space contains $\sum_{b=0}^B\binom Nb$.
 
-\paragraph{贪心与局部交换。}
-Forward Greedy 从空分配出发，反复加入式~\eqref{eq:static-marginal} 最大的节点。严格预算执行 $B$ 次添加；最多预算可在最大边际不再为正时停止。每次动作改变后重新计算相关暴露。Local Swap 在初始分配上搜索一进一出的可行交换，直至没有超过数值容差的改进；最多预算另允许单节点添加或删除。扩大邻域可包含双添加、双删除和两对交换，但需要单独计入搜索成本。改变节点集合 $C$ 只影响 $C\cup\bigcup_{j\in C}\mathcal N(j)$ 的评分项，可通过邻居处理计数进行增量更新。
+\paragraph{Greedy construction and local swaps.}
+Forward Greedy starts from the empty allocation and repeatedly adds the node with the largest marginal score in Equation~\eqref{eq:static-marginal}. It performs $B$ additions for an exact-count budget. Under an at-most-count budget, it may stop when the largest marginal gain is no longer positive. Relevant exposures are recomputed after each allocation change. Local Swap searches for feasible one-for-one exchanges from an initial allocation until no improvement exceeds a numerical tolerance. The at-most-count mode also permits single-node additions and deletions. Expanded neighborhoods may include two-node additions, two-node deletions, and two-pair exchanges, whose computational costs are reported separately. Changing a node set $C$ affects only the score terms in $C\cup\bigcup_{j\in C}\mathcal N(j)$, allowing incremental updates using treated-neighbor counts.
 
-\paragraph{多起点联合搜索。}
-贪心随机自适应搜索（Greedy Randomized Adaptive Search Procedure, GRASP）\citep{feo1995} 的每次重启包含随机贪心构造与局部改进。构造时从受限候选集中采样：
+\paragraph{Multistart joint search.}
+Each restart of the Greedy Randomized Adaptive Search Procedure (GRASP)\citep{feo1995} consists of randomized greedy construction followed by local improvement. Construction samples from a restricted candidate list,
 \begin{equation}
 \mathcal R_\rho=\{j:\Delta_j\geq\Delta_{\max}-\rho(\Delta_{\max}-\Delta_{\min})\},\qquad \rho\in[0,1].
 \end{equation}
-严格预算构造 $B$ 人，最多预算允许不同构造人数；每次构造后进行局部交换，并在固定重启次数或时间预算内保留最佳结果。将 Greedy 结果作为初始 incumbent，可保证最终返回评分不低于该初始解，但并不保证严格改进或全局最优。候选池可由各次搜索得到的互异高评分分配、不同预算水平分配和必要的等待动作构成。
+The exact-count mode constructs $B$ treatments, while the at-most-count mode permits different construction sizes. Each construction is refined through local swaps, and the best allocation is retained within a fixed restart count or time budget. Using the Greedy solution as the initial incumbent ensures that the returned score is no lower than that initial score, without guaranteeing strict improvement or global optimality. The action catalog can combine distinct high-scoring search outputs, allocations using different treatment counts, and a waiting action where required.
 
-\paragraph{精确参照。}
-多数暴露评分可表示为混合整数线性规划（MILP）。令 $\tau_i=\lfloor d_i/2\rfloor+1$，以二元 $s_i$ 表示多数暴露、$u_i=z_is_i$ 表示乘积，施加
+\paragraph{Exact reference.}
+The majority-exposure score admits a mixed-integer linear programming (MILP) formulation. Let $\tau_i=\lfloor d_i/2\rfloor+1$, introduce binary $s_i$ for majority exposure and $u_i=z_is_i$ for the product, and impose
 \begin{align}
 \sum_jA_{ij}z_j&\geq\tau_is_i,&
 \sum_jA_{ij}z_j&\leq\tau_i-1+(d_i-\tau_i+1)s_i,\\
 0\leq u_i&\leq z_i,&u_i&\leq s_i,\qquad u_i\geq z_i+s_i-1.
 \end{align}
-定义 $\alpha_i=\widehat\mu_i(1,0)-\widehat\mu_i(0,0)$、
-$\beta_i=\widehat\mu_i(0,1)-\widehat\mu_i(0,0)$ 和
-$\delta_i=\widehat\mu_i(1,1)-\widehat\mu_i(1,0)-\widehat\mu_i(0,1)+\widehat\mu_i(0,0)$，则目标为
+Define $\alpha_i=\widehat\mu_i(1,0)-\widehat\mu_i(0,0)$,
+$\beta_i=\widehat\mu_i(0,1)-\widehat\mu_i(0,0)$, and
+$\delta_i=\widehat\mu_i(1,1)-\widehat\mu_i(1,0)-\widehat\mu_i(0,1)+\widehat\mu_i(0,0)$. The objective is
 \begin{equation}
 \max\frac1N\sum_i[\widehat\mu_i(0,0)+\alpha_i z_i+\beta_i s_i+\delta_i u_i],
 \end{equation}
-并结合预算约束。只有获得全局最优性认证的结果才称为精确最优；限时求解同时报告可行值、上界与最优性间隙。
+subject to the budget constraint. A result is called exact only when global optimality is certified. Time-limited runs report the best feasible value, an upper bound, and the optimality gap.
 
-\paragraph{局限与递进关系。}
-严格多数阈值可能产生单步负增益、联合正增益。例如三节点完全图、$B=2$ 的最多预算下，设所有节点 $\mu_i(0,0)=0$、$\mu_i(1,0)=-1$、$\mu_i(a,1)=10$。空分配、单人分配、两人分配的评分分别为 $0,-1/3,8/3$；只接受正单步增益的 Greedy 停在空分配。局部扩大邻域与多起点搜索能缓解此类障碍，但需要额外计算，且静态评分本身不描述未来状态。下一场景先引入反馈学习，随后再引入物理动态。
+\paragraph{Limitations and progression.}
+Strict-majority thresholds can produce negative single-node gains but positive joint gains. For example, consider a three-node complete graph with an at-most-count budget $B=2$ and node means $\mu_i(0,0)=0$, $\mu_i(1,0)=-1$, and $\mu_i(a,1)=10$. The empty, single-node, and two-node allocations have scores $0$, $-1/3$, and $8/3$, respectively. A Greedy method accepting only positive single-node gains stops at the empty allocation. Larger local neighborhoods and multistart search can mitigate this obstacle at additional computational cost. Static scores also leave future states unmodeled. The next setting first introduces feedback learning, followed by physical dynamics.
 
-\subsection{候选策略池的在线自适应探索（Online Adaptive Exploration）}
+\subsection{Online Adaptive Exploration over an Action Catalog}
 \label{sec:bandit}
-固定网络、预算和候选池后，将每个完整分配视为一个 Bandit 臂，而非将各节点分别作为互不相关的臂。此时没有疲劳或冷却，动作不改变后续物理状态，未知均值为
+With the network, budget, and catalog fixed, each complete allocation is a bandit arm. Nodes are not treated as unrelated arms. This setting has no fatigue cost or cooldown, and actions do not change subsequent physical states. The unknown means are
 \begin{equation}
 m_a=V_{\mathrm{env},\psi}(\mathbf z^{(a)}),\qquad R_t=m_{a_t}+\xi_t.
 \end{equation}
-若节点噪声独立且服从 $\mathcal N(0,\sigma^2)$，则 $\xi_t\sim\mathcal N(0,\sigma_R^2)$，$\sigma_R^2=\sigma^2/N$；存在相关噪声时必须重新计算聚合方差。候选均值在一次运行中固定，变化的是对其收益的认识。
+If node-level noise is independent and distributed as $\mathcal N(0,\sigma^2)$, then $\xi_t\sim\mathcal N(0,\sigma_R^2)$ with $\sigma_R^2=\sigma^2/N$. Correlated noise requires a different aggregate variance calculation. Candidate means remain fixed within a run; only knowledge about their rewards changes.
 
-\paragraph{连续奖励 UCB。}
-令 $n_a(t)=\sum_{u<t}\ind\{a_u=a\}$，$\bar R_a(t)$ 为已观察样本均值。首先依次访问未观察候选，随后按
+\paragraph{UCB for continuous rewards.}
+Let $n_a(t)=\sum_{u<t}\ind\{a_u=a\}$ and let $\bar R_a(t)$ be the observed sample mean. The method first visits unobserved candidates in sequence and subsequently chooses
 \begin{equation}
 a_t\in\arg\max_a\left\{\bar R_a(t)+c\sigma_R
-\sqrt{\frac{2\log(\max\{2,t+1\})}{n_a(t)}}\right\}
+\sqrt{\frac{2\log(\max\{2,t+1\})}{n_a(t)}}\right\},
 \label{eq:ucb}
 \end{equation}
-选择动作，$c$ 由验证环境确定。该指数使用置信上界的探索思想\citep{auer2002}，与此处的高斯奖励尺度对应，不直接宣称适用有界奖励 UCB1 的全部理论结论。首次观察及初始化均计入交互预算；当 $T<M$ 时，仅完成前 $T$ 个候选的首次访问。并列时采用预先固定的规则，并通过候选重排实验检查初始化顺序的影响。
+where $c$ is selected on validation environments. This index follows the upper-confidence-bound exploration principle\citep{auer2002} and matches the Gaussian reward scale used here. We do not directly claim all theoretical results of bounded-reward UCB1 for this setting. Initial visits count toward the interaction budget. If $T<M$, only the first $T$ candidates receive an initial observation. Ties follow a predetermined rule, and candidate-permutation experiments assess the effect of initialization order.
 
-\paragraph{基线与评价目标。}
-Random 均匀采样候选；$\varepsilon$-greedy 以概率 $1-\varepsilon_t$ 选择当前经验得分最大动作，其余概率均匀探索，未访问得分的初始化须明确记录。FrozenPFN 始终选择 $a_F\in\arg\max_a\widehat V(\mathbf z^{(a)})$，收到奖励后不更新排序。设 $m_*=\max_a m_a$，候选集内伪遗憾为
+\paragraph{Baselines and evaluation objective.}
+Random samples candidates uniformly. With probability $1-\varepsilon_t$, $\varepsilon$-greedy selects the action with the largest current empirical score; otherwise, it explores uniformly. Initialization of unvisited scores must be recorded explicitly. FrozenPFN always selects $a_F\in\arg\max_a\widehat V(\mathbf z^{(a)})$ and does not update its ranking after rewards arrive. Let $m_*=\max_a m_a$. Catalog-restricted pseudo-regret is
 \begin{equation}
 \mathcal R_T=\sum_{t=0}^{T-1}(m_*-m_{a_t}).
 \label{eq:regret}
 \end{equation}
-其期望最小化等价于该固定时域下的累计期望奖励最大化。真实臂均值只供评测，不进入算法输入；观察噪声不直接出现在伪遗憾定义中。FrozenPFN 的伪遗憾为 $T(m_*-m_{a_F})$，Random 的期望伪遗憾为 $T(m_*-M^{-1}\sum_a m_a)$。
+Minimizing its expectation is equivalent to maximizing cumulative expected reward over the fixed horizon. True arm means are used only for evaluation and are excluded from algorithm inputs. Observation noise does not appear directly in the pseudo-regret definition. FrozenPFN has pseudo-regret $T(m_*-m_{a_F})$, while Random has expected pseudo-regret $T(m_*-M^{-1}\sum_a m_a)$.
 
-第~\ref{sec:pfn} 节的历史条件 PFN 在移除物理动态、取 $\gamma=1$ 后，同样适用于本场景。其参数冻结但动作分布随事实历史改变，与 FrozenPFN 的固定排序有本质区别。Bandit 处理未知收益下的信息价值，无法替代包含动作后效的 MDP 规划。
+The history-conditioned PFN in Section~\ref{sec:pfn} also applies to this setting when physical dynamics are removed and $\gamma=1$. Its parameters remain frozen, but factual history changes its action distribution, unlike FrozenPFN's fixed ranking. A bandit formulation captures the information value of actions under unknown rewards; action-dependent physical aftereffects require an MDP formulation.
 
-\subsection{已知动态约束下的有限时域规划（Finite-Horizon Planning under Known Dynamics）}
+\subsection{Finite-Horizon Planning under Known Dynamics}
 \label{sec:planning}
-设奖励模型 $r_m$ 与转移 $F_x$ 已知，$x$ 表示 FC 或 CD 的状态记忆。在同一候选池内，精确动态规划满足
+Suppose the reward model $r_m$ and transition $F_x$ are known, where $x$ is the memory state for fatigue cost or cooldown. Within the same catalog, exact dynamic programming satisfies
 \begin{align}
 V_{m,0}(x)&=0,\\
 Q_{m,L}(x,a)&=r_m((L,x),a)+\gamma V_{m,L-1}(F_x(x,a)),\\
 V_{m,L}(x)&=\max_{a\in\mathcal A((L,x))}Q_{m,L}(x,a).
 \label{eq:bellman}
 \end{align}
-自 $L=1$ 至 $T$ 保存价值与最优动作即可得到有限时域策略。普通规划使用预测评分模型；实际环境真值模型的最优策略作为单独标明的信息更充分的参照。
+Storing values and optimal actions from $L=1$ to $T$ yields a finite-horizon policy. Ordinary planning uses the predicted-score model. The optimal policy under the true environment model is reported separately as a reference with more information.
 
-滚动时域规划在当前状态展开深度 $\min\{d,L_t\}$ 的搜索树，以零作为截断末值，仅执行首个动作，下一期重新规划。$d=1$ 对应同模型下的短视选择；当深度覆盖剩余时域时，与完整规划一致。比较时使用滚动执行完整 $T$ 期的回报，而非短搜索树的局部计划值。
+Rolling-horizon planning expands a search tree of depth $\min\{d,L_t\}$ from the current state, uses a zero terminal value at the truncation boundary, executes only the first action, and replans in the next period. The depth $d=1$ gives myopic selection under the same model. When the depth covers the remaining horizon, it agrees with full planning. Comparisons use the return from rolling execution over all $T$ periods, rather than the local value of the truncated search tree.
 
-\paragraph{疲劳模型的可分性质。}
-对于固定基础评分 $b(\mathbf z)$ 和初始 $\mathbf f_0=\mathbf0$，FC 的总价值可重写为
+\paragraph{Separability of the fatigue cost model.}
+For a fixed base score $b(\mathbf z)$ and initial memory $\mathbf f_0=\mathbf0$, total value under fatigue cost can be rewritten as
 \begin{equation}
 J=\sum_{t=0}^{T-2}\gamma^t
 \left[b(\mathbf z_t)-\gamma\frac{c_f}{N}\|\mathbf z_t\|_1\right]
 +\gamma^{T-1}b(\mathbf z_{T-1}).
-\label{eq:fc-separable}
+\label{eq:fatigue-cost-separable}
 \end{equation}
-因此严格人数预算下成本对动作选择恒定，每期最大化 $b$ 的短视策略已最优。最多人数预算下，非末期最大化 $b(\mathbf z)-\gamma c_f\|\mathbf z\|_1/N$，末期最大化 $b(\mathbf z)$；深度二的滚动规划足以得到最优当前动作。FC 是验证历史成本与终端处理的可解析基准，不适合据此预设复杂长期规划的普遍优势。
+Under an exact-count budget, the cost is constant across action choices, so the myopic policy maximizing $b$ in each period is already optimal. Under an at-most-count budget, nonterminal periods maximize $b(\mathbf z)-\gamma c_f\|\mathbf z\|_1/N$, and the last period maximizes $b(\mathbf z)$. Rolling planning with depth two is sufficient to choose an optimal current action. The fatigue cost model is an analytically tractable benchmark for checking history costs and terminal handling; it does not establish a general advantage for complex long-term planning.
 
-例如 $N=2,T=3,\gamma=1,c_f=2$，零动作与单人动作的基础评分为 $0$ 和 $0.8$。每次处理在下一期带来 $1$ 的成本，最优序列为前两期等待、末期处理，价值 $0.8$；始终短视处理的价值为 $0.4$。这些数字是手算构造，非实验结果。
+For example, let $N=2,T=3,\gamma=1,c_f=2$, and assign base scores $0$ and $0.8$ to the zero action and a single-node action. Each treatment incurs a cost of $1$ in the next period. The optimal sequence waits for two periods and treats in the final period, attaining value $0.8$. Repeated myopic treatment attains $0.4$. These are analytically constructed values, not empirical results.
 
-\paragraph{冷却带来的跨期耦合。}
-CD 中当前动作改变未来可用集合，不能按期独立最大化。取两个相邻节点、$B=2,T=3,\gamma=1$，四个动作的基础期望奖励为
+\paragraph{Intertemporal coupling through cooldown.}
+Under cooldown, the current action changes the future feasible set, preventing independent maximization in each period. Consider two adjacent nodes with $B=2,T=3,\gamma=1$, and the following expected base rewards:
 \begin{equation}
 \begin{array}{c|cccc}
 \mathbf z&(0,0)&(1,0)&(0,1)&(1,1)\\\hline
 b(\mathbf z)&0&3&3&5
 \end{array}.
-\label{eq:cd-example}
+\label{eq:cooldown-example}
 \end{equation}
-短视策略首期同时处理两人，此后只能等待，总价值为 $5$；序列 $(1,0),(0,1),(0,0)$ 的价值为 $6$。由两期冷却可知各节点在三期内最多处理一次，枚举即可确认 $6$ 为最优值。该表可由 $m_i(z_i,e_i)=6z_i-z_ie_i$ 的网络平均生成。
+The myopic policy treats both nodes in the first period and can only wait thereafter, earning total value $5$. The sequence $(1,0),(0,1),(0,0)$ earns $6$. A two-period cooldown permits each node to be treated at most once within the three-period horizon, and enumeration confirms that $6$ is optimal. These rewards can be generated as the network average of $m_i(z_i,e_i)=6z_i-z_ie_i$.
 
-\paragraph{计算瓶颈。}
-CD 的记忆状态至多 $3^N$ 个，显式动态规划最多需要 $O(T3^NM)$ 次状态--动作评估，单次奖励及转移计算另计；实际可达状态可能较少。深度 $d$ 的朴素滚动搜索也可能展开 $O(M^d)$ 个节点。对大图，逐状态精确求解受到显著限制。这推动我们通过训练学习共享决策规律，将新实例上的搜索计算转移到跨任务训练阶段。
+\paragraph{Computational bottlenecks.}
+Cooldown has at most $3^N$ memory states. Explicit dynamic programming can require $O(T3^NM)$ state--action evaluations, excluding the cost of each reward and transition calculation; the reachable state set may be smaller. A naive depth-$d$ rolling search can also expand $O(M^d)$ nodes. Exact state-by-state solution is therefore severely limited on large graphs. This motivates learning shared decision rules that shift computation from search on new instances to training across tasks.
 
-\subsection{摊销 PFN 强化学习策略（Amortized PFN RL Policy）}
+\subsection{Amortized PFN Reinforcement Learning Policy}
 \label{sec:pfn}
-\subsubsection{任务先验、事实上下文与方法定位}
-核心场景中，学习器不读取完整奖励--转移模型，而根据事实交互学习长期决策。任务 $\psi$ 包含图、节点特征、响应机制、动态类型、预算、候选池、噪声与时域。训练任务从明确指定的先验 $p_{\mathrm{train}}(\psi)$ 抽取，验证与测试按潜在任务划分，同一任务的不同轨迹不能跨划分泄漏。
+\subsubsection{Task Priors, Factual Context, and Method Scope}
+In the core setting, the learner acquires long-term decision rules from factual interaction without reading a complete reward--transition model. A task $\psi$ comprises the graph, node features, response mechanism, dynamics type, budget, catalog, noise, and horizon. Training tasks are drawn from an explicitly specified prior $p_{\mathrm{train}}(\psi)$. Validation and test splits are defined by latent task, and different trajectories from the same task cannot leak across splits.
 
-当前可用历史写为
+The available history and policy input are
 \begin{equation}
 \mathcal D_t=((q_u,a_u,R_u,q_{u+1},D_u):u<t),\qquad
 I_t=(G,X,\mathcal C,B,\kappa,q_t,\mathcal D_t),
 \label{eq:context}
 \end{equation}
-其中 $D_u$ 为终止标志。若允许携带同一任务以往回合的历史，则附带回合编号；跨任务切换时清空任务上下文。模型学习的是 $\pi_\theta(a_t\mid I_t)$，部署时固定 $\theta$，仅通过更新上下文改变动作分布。未知任务的信息不确定性由上下文近似表达，并不声称实现精确贝叶斯后验。
+where $D_u$ is a termination indicator. If histories from earlier episodes of the same task are allowed, episode identifiers accompany the records. Task context is cleared when switching tasks. The model learns $\pi_\theta(a_t\mid I_t)$. During deployment, $\theta$ is fixed, and the action distribution changes only through context updates. Context approximately represents uncertainty about an unknown task; we do not claim exact Bayesian posterior inference.
 
-为实现与原有方法的衔接，可增加读取静态预测表或初始事实样本的变体，但将其作为明确标记的附加信息实验。核心事实学习设置不要求先运行静态 PFN 预测器。若候选生成仍依赖静态搜索，其准备成本和依赖必须如实计入；“端到端策略”并不消除外部候选构造步骤。
+To connect with the earlier approach, optional variants may read a static prediction table or initial factual samples. These are explicitly labeled experiments with additional information. The core factual-learning setting does not require running a static PFN predictor first. If catalog generation still relies on static search, its preparation cost and dependencies must be included. An end-to-end policy does not eliminate external catalog construction.
 
-\subsubsection{图状态编码与 Transformer 历史融合}
-节点输入包含结构、属性和当前状态：
+\subsubsection{Graph State Encoding and Transformer History Fusion}
+Node inputs include structure, attributes, and current state:
 \begin{equation}
 e_{i,t}^{(0)}=\operatorname{MLP}_{\mathrm{in}}
 ([X_i,d_i,f_{i,t},h_{i,t},\chi_{i,t},B/N,L_t/T]).
 \end{equation}
-FC 令 $h_{i,t}=0,\chi_{i,t}=1$，CD 令 $f_{i,t}=0$，另提供动态类型及预算模式的全局标记。无动态的特例将历史状态置零。采用 GCN\citep{kipf2017} 时，令 $\widetilde A=A+I_N$，图层为
+The fatigue cost setting uses $h_{i,t}=0,\chi_{i,t}=1$; the cooldown setting uses $f_{i,t}=0$. Global indicators identify the dynamics type and budget mode. In the special case without dynamics, historical state variables are set to zero. With a graph convolutional network (GCN)\citep{kipf2017}, let $\widetilde A=A+I_N$ and use
 \begin{equation}
 H_t^{(\ell+1)}=\operatorname{ReLU}
 (\widetilde D^{-1/2}\widetilde A\widetilde D^{-1/2}H_t^{(\ell)}W_\ell).
 \end{equation}
-GAT\citep{velickovic2018} 可作为替换，利用学习的邻居权重聚合消息；残差连接保留节点自身历史与可用性，池化得到网络摘要。
+A graph attention network (GAT)\citep{velickovic2018} is an alternative that aggregates messages with learned neighbor weights. Residual connections preserve each node's own history and availability, while pooling produces a network summary.
 
-轨迹编码器将已观察的状态、完整动作表示、聚合奖励、下一状态、终止与回合时间编码为令牌。Transformer\citep{vaswani2017} 通过因果注意力处理历史，再由当前图状态查询历史表征，输出节点表示 $u_{i,t}$ 和全局表示 $u_{g,t}$。其作用是从反馈中提取未知响应规律，并区分物理状态变化与对环境认识的变化。输入不含当前尚未观察的奖励或未来记录；上下文截断长度应作为实验因素报告。
+The trajectory encoder tokenizes observed states, complete action representations, aggregate rewards, next states, termination indicators, and episode times. A Transformer\citep{vaswani2017} processes history through causal attention. The current graph state then queries the historical representation to produce node embeddings $u_{i,t}$ and a global embedding $u_{g,t}$. This extracts unknown response patterns from feedback while distinguishing physical state changes from changes in knowledge about the environment. Inputs exclude the current unobserved reward and future records. Context truncation length is reported as an experimental factor.
 
-图节点不使用绑定任意编号的位置嵌入。节点重排时，图、特征、状态和候选向量同步变换。候选表示由分配内容和图结构生成，不能仅依赖候选编号；回合时间位置用于区分反馈顺序。图结构编码的等变性与自回归解码的顺序敏感性分别验证。
+Graph nodes do not receive positional embeddings tied to arbitrary identifiers. Permuting nodes transforms the graph, features, state, and candidate allocations together. Candidate representations are generated from allocation content and graph structure, rather than solely from action indices. Episode-time positions distinguish feedback order. Graph encoding is permutation equivariant under synchronized relabeling, whereas autoregressive decoding additionally depends on the chosen node order.
 
-\subsubsection{候选联合分布与动作掩码}
-主模型在与规划器相同的候选池上直接输出联合动作分布。节点基础倾向为 $p^0_{i,t}=\operatorname{sigmoid}(w^\top u_{i,t}+b)$，候选得分为
+\subsubsection{Joint Candidate Distribution and Action Masking}
+The main model directly outputs a joint action distribution on the same catalog used by the planner. The base selection propensity of node $i$ is $p^0_{i,t}=\operatorname{sigmoid}(w^\top u_{i,t}+b)$, and the candidate score is
 \begin{equation}
 \ell_\theta(I_t,a)=\sum_i\left[z_i^{(a)}\log p^0_{i,t}
 +(1-z_i^{(a)})\log(1-p^0_{i,t})\right]
 +g_\theta(I_t,\mathbf z^{(a)}).
 \label{eq:logit}
 \end{equation}
-共享动作头 $g_\theta$ 读取处理节点池化表示、处理邻接关系、暴露结构及全局信息，使候选评分能够表达节点间联合效应，而非局限于独立节点评分。数值实现使用对数 Sigmoid。结合式~\eqref{eq:feasible} 的掩码，
+The shared action head $g_\theta$ reads pooled treated-node embeddings, adjacency relationships among treated nodes, exposure structure, and global information. It therefore supports joint effects beyond independent node scores. The implementation uses log-sigmoid for numerical stability. Applying the mask from Equation~\eqref{eq:feasible} gives
 \begin{equation}
 \pi_\theta(a\mid I_t)=
 \frac{M_t(a)\exp\ell_\theta(I_t,a)}
 {\sum_{b=1}^M M_t(b)\exp\ell_\theta(I_t,b)}.
 \label{eq:masked-policy}
 \end{equation}
-在合法候选上减去最大 logit 后归一化，非法动作概率为零。节点最终入选概率为 $\sum_a\pi_\theta(a\mid I_t)z_i^{(a)}$，一般不同于基础倾向 $p^0_{i,t}$。
+Normalization subtracts the largest feasible logit before exponentiation. Infeasible actions have zero probability. The final marginal selection probability for node $i$ is $\sum_a\pi_\theta(a\mid I_t)z_i^{(a)}$, which generally differs from $p^0_{i,t}$.
 
-训练时采样一个完整动作，保存其编号、向量与联合对数概率；实际执行后才接收奖励并更新状态。确定性部署选择合法候选中得分最大的动作。两种模式分别评价，均不将神经网络输出解释为已认证的全局最优解。
+Training samples one complete action and stores its index, allocation vector, and joint log-probability. Reward reception and state updates occur only after execution. Deterministic deployment selects the feasible candidate with the highest score. The reported deployment evaluations use deterministic candidate selection.
 
-\subsubsection{自回归分配与静态、在线特例}
-为保留结构化生成能力，另设候选前缀解码变体。给定节点顺序 $v_1,\ldots,v_N$，令
+\subsubsection{Autoregressive Allocation and Static and Online Special Cases}
+To retain structured generation, we also consider a candidate-prefix decoding variant. Given node order $v_1,\ldots,v_N$, define
 \begin{align}
 \mathcal C_{t,j}&=\{\mathbf z^{(a)}:a\in\mathcal A(q_t),\ 
 z_{v_\ell}^{(a)}=z_{t,v_\ell}\ \forall\ell<j\},\\
 M_{t,j}(b)&=\ind\{\exists\mathbf z\in\mathcal C_{t,j}:z_{v_j}=b\},\quad b\in\{0,1\}.
 \end{align}
-逐位 masked softmax 生成分配，其完整概率为
+A bitwise masked softmax generates the allocation, with complete probability
 \begin{equation}
 \pi_\theta(\mathbf z_t\mid I_t)=\prod_{j=1}^N
 \pi_\theta(z_{t,v_j}\mid\mathbf z_{t,v_{<j}},I_t).
 \label{eq:autoregressive}
 \end{equation}
-从非空合法候选集出发，每一步保留可完成的前缀，最终必在同一候选池内。一次长度为 $N$ 的解码只对应一次环境动作，内部前缀不是新的事实交互。训练对图和动作同步随机重排，评价顺序敏感性。
+Starting from a nonempty feasible catalog, each step retains a prefix that can be completed, so the final allocation belongs to the same catalog. A length-$N$ decoding process is one environment action; internal prefixes are not additional factual interactions. For this variant, synchronized node permutations provide a way to vary the decoding order while preserving the underlying task.
 
-静态全预算空间的生成变体不受固定候选池限制。若已选人数为 $c_j$、当前位置之后剩余节点数为 $r_j=N-j$，则预算掩码为
+A static generation variant over the full budget-feasible space is not restricted to a fixed catalog. If $c_j$ nodes have already been selected and $r_j=N-j$ nodes remain after the current position, the budget masks are
 \begin{equation}
 M_j^{=}(b)=\ind\{0\leq B-c_j-b\leq r_j\},\qquad
 M_j^{\leq}(b)=\ind\{c_j+b\leq B\}.
 \label{eq:budget-mask}
 \end{equation}
-该变体在 $T=1$、奖励为 $\widehat V(\mathbf z)$ 时还原为离线 PFN 分配策略。无物理动态且奖励为事实反馈时，历史条件策略还原为在线 PFN Bandit 策略。全预算空间与候选空间使用不同的最优参照，不能混为同一动作范围的比较。逐位取最大概率是构造性解码，不等于求解联合概率或收益的全局最大值。
+For $T=1$ and reward $\widehat V(\mathbf z)$, this variant reduces to an offline PFN allocation policy. Without physical dynamics and with factual reward feedback, the history-conditioned policy reduces to an online PFN bandit policy. Full-space and catalog-restricted policies have different optimality references and must not be compared as if their action spaces were identical. Selecting the most probable bit at each step is constructive decoding, not global maximization of joint probability or reward.
 
-\subsubsection{跨任务端到端训练}
-共享参数直接优化跨任务长期奖励：
+\subsubsection{End-to-End Training across Tasks}
+Shared parameters directly optimize long-term reward across tasks:
 \begin{equation}
 J(\theta)=\E_{\psi\sim p_{\mathrm{train}}}\E_{\pi_\theta,\psi}
 \left[\sum_{t=0}^{T-1}\gamma^tR_t\right].
 \label{eq:meta-objective}
 \end{equation}
-图编码器、历史编码器与动作头由同一回报目标联合更新，无需对二元处理或多数阈值求导。优化对象是完整分配及其后续影响，不是逐节点反事实预测误差。
+The graph encoder, history encoder, and action head are jointly updated through the same return objective, without differentiating binary treatments or majority thresholds. Optimization targets complete allocations and their subsequent consequences rather than nodewise counterfactual prediction errors.
 
-可选的行为克隆预训练使用训练任务上的启发式或规划专家动作：
+Optional behavior-cloning pretraining uses heuristic or planning-expert actions on training tasks:
 \begin{equation}
 \mathcal L_{\mathrm{BC}}=-\E_{(I,a^{\mathrm E})\sim\mathcal D_{\mathrm E}}
 \log\pi_\theta(a^{\mathrm E}\mid I).
 \end{equation}
-自回归动作的对数概率是逐位对数概率之和。专家初始化可能改善训练起点，但专家演示属于额外信息；严格事实轨迹主实验不使用隐藏模型生成专家标签，该变体须单独报告演示来源和成本。
+For autoregressive actions, the joint log-probability is the sum of bitwise log-probabilities. Expert initialization may improve the starting policy, but demonstrations constitute additional information. The main strict factual-trajectory experiment does not use hidden models to generate expert labels. This variant reports the source and cost of demonstrations separately.
 
-令 $G_t=\sum_{u=t}^{T-1}\gamma^{u-t}R_u$，$v_\phi(I_t)$ 为与当前采样动作无关的价值基线。REINFORCE\citep{williams1992} 给出
+Let $G_t=\sum_{u=t}^{T-1}\gamma^{u-t}R_u$, and let $v_\phi(I_t)$ be a value baseline independent of the currently sampled action. REINFORCE\citep{williams1992} yields
 \begin{equation}
 \nabla_\theta J=\E\left[\sum_{t=0}^{T-1}\gamma^t
 (G_t-v_\phi(I_t))\nabla_\theta\log\pi_\theta(a_t\mid I_t)\right].
 \label{eq:reinforce}
 \end{equation}
-这一目标将动作对后续状态以及后续信息的影响纳入训练。价值基线只用于降低方差，不构成独立的组合优化步骤。
+This objective incorporates the influence of actions on subsequent states and information. The value baseline reduces gradient variance without introducing a separate combinatorial optimization step.
 
-主训练可采用 PPO\citep{schulman2017}。冻结旧策略采集事实轨迹后，在相同的历史、掩码和已执行动作上计算
+The main training procedure can use PPO\citep{schulman2017}. After collecting factual trajectories with a frozen old policy, compute the ratio using the same histories, masks, and executed actions:
 \begin{align}
 \varrho_t(\theta)&=\exp\{\log\pi_\theta(a_t\mid I_t)-\log\pi_{\theta_{\mathrm{old}}}(a_t\mid I_t)\},\\
 \mathcal L_{\mathrm{clip}}&=-\E_{\mathrm{old}}\sum_t\gamma^t
 \min\{\varrho_t\widehat A_t,
 \clip(\varrho_t,1-\epsilon,1+\epsilon)\widehat A_t\}.
 \end{align}
-采用 GAE\citep{schulman2016} 时，在同一回合内反向递推
+With generalized advantage estimation (GAE)\citep{schulman2016}, recurse backward within each episode:
 \begin{align}
 \delta_t&=R_t+\gamma(1-D_t)v_{\phi_{\mathrm{old}}}(I_{t+1})-v_{\phi_{\mathrm{old}}}(I_t),\\
 \widehat A_t&=\delta_t+\gamma\lambda_{\mathrm{GAE}}(1-D_t)\widehat A_{t+1},\\
 \widehat G_t&=\widehat A_t+v_{\phi_{\mathrm{old}}}(I_t).
 \end{align}
-完整回合取 $\widehat A_T=0$；真实终点不 bootstrap，因批次长度截断时使用末状态价值且不跨回合传播优势。总损失为
+Set $\widehat A_T=0$ for a complete episode. True terminal states are not bootstrapped. Truncation due to batch length uses the final state value, and advantages do not propagate across episode boundaries. The total loss is
 \begin{equation}
 \mathcal L=\mathcal L_{\mathrm{clip}}
 +c_V\E_{\mathrm{old}}\sum_t\gamma^t[v_\phi(I_t)-\sg(\widehat G_t)]^2
 -c_H\E_{\mathrm{old}}\sum_t\gamma^t\mathcal H(\pi_\theta(\cdot\mid I_t)).
 \end{equation}
-优势与价值目标停止梯度；候选分布可精确计算熵。PPO 更新不重新采样动作替换原动作的概率，也不以当前更新后的编码缓存冒充旧策略概率。主评价可取 $\gamma=1$，其他折扣下保留与目标一致的时间权重。
+Advantage and value targets are detached from the computation graph. Entropy can be calculated exactly for the candidate distribution. PPO updates use the original executed action probabilities rather than resampling replacement actions. Encodings recomputed after parameter updates cannot substitute for stored old-policy probabilities. The main evaluation may use $\gamma=1$; other discount settings retain time weights consistent with the objective.
 
 \begin{algorithm}[htbp]
-\caption{事实交互驱动的摊销 PFN 策略训练与部署}
+\caption{Training and deploying an amortized PFN policy from factual interactions}
 \label{alg:training}
 \begin{algorithmic}[1]
-\Require 任务先验、独立验证任务、训练交互预算、公开约束接口
-\State 初始化图网络、Transformer、动作头及价值网络
-\For{每次训练迭代}
-  \State 冻结旧参数，抽取训练任务并初始化其物理状态与上下文
-  \For{任务中的每一期}
-    \State 编码当前图状态及已观察历史，按合法候选掩码采样完整动作
-    \State 执行动作，只接收其事实奖励、下一状态和终止标记
-    \State 保存输入历史、动作、反馈与旧联合对数概率，追加事实上下文
+\Require Task prior, independent validation tasks, training interaction budget, public constraint interface
+\State Initialize the graph network, Transformer, action head, and value network
+\For{each training iteration}
+  \State Freeze old parameters; sample training tasks and initialize states and contexts
+  \For{each period in a task}
+    \State Encode the graph state and observed history; sample a masked complete action
+    \State Execute the action; receive its factual reward, next state, and terminal flag
+    \State Store history, action, feedback, and old joint log-probability; append factual context
   \EndFor
-  \State 按回合边界计算优势与价值目标，进行预定次数的 PPO 更新
+  \State Compute episode-aware advantages and targets; perform the scheduled PPO updates
 \EndFor
-\State 由验证任务选择模型并冻结共享参数
-\State 新任务中逐期前向推理、执行合法分配，并仅通过事实上下文适应
+\State Select a model using validation tasks and freeze shared parameters
+\State On new tasks, infer and execute feasible allocations; adapt through factual context
 \end{algorithmic}
 \end{algorithm}
 
-REINFORCE 和 PPO 的上述训练需要当前策略收集的新轨迹。将训练放在部署之前，不等于可以直接对任意固定历史日志进行标准 on-policy 更新。若只有不可追加交互的离线日志，需要另设离线强化学习协议并处理行为概率、动作覆盖与分布偏移；本文不把该条件下的效果作为已解决结论。
+The REINFORCE and PPO procedures above require fresh trajectories collected by the current policy. Scheduling training before deployment does not make standard on-policy updates valid for arbitrary fixed historical logs. If only offline logs are available and further interaction is impossible, a separate offline reinforcement learning protocol is required to address behavior probabilities, action coverage, and distribution shift. Performance under that condition is outside the established scope of this procedure.
 
-\subsubsection{传统强化学习基线：Q-learning 与 Dyna-Q}
-Q-learning\citep{watkins1992} 在同样的可见状态、候选池与真实交互预算下更新
+\subsubsection{Traditional Reinforcement Learning Baselines: Q-learning and Dyna-Q}
+Under the same observable states, catalog, and real-interaction budget, Q-learning\citep{watkins1992} updates
 \begin{align}
 y_t&=\begin{cases}R_t,&D_t=1,\\
 R_t+\gamma\max_{b\in\mathcal A(q_{t+1})}Q(q_{t+1},b),&D_t=0,
 \end{cases}\\
 Q(q_t,a_t)&\leftarrow Q(q_t,a_t)+\alpha[y_t-Q(q_t,a_t)].
 \end{align}
-状态必须包含剩余时域，探索与最大化均限定于合法动作。评估冻结 Q 表；未访问状态的回退规则预先固定。
+The state includes the remaining horizon, and exploration and maximization use only feasible actions. Evaluation freezes the Q table, with a predefined fallback for unvisited states.
 
-Dyna-Q 在每次真实更新后，以事实记录维护经验模型：访问次数 $n(q,a)$、奖励样本均值 $\widehat r(q,a)$，以及下一状态与终止标志的联合频率 $\widehat P(q',D\mid q,a)$。随后从已访问键中抽取 $K_{\mathrm D}$ 个状态--动作对，按经验模型产生额外 Q 更新。未访问条目保持未知，不从评测器复制真值或为未访问动作填入结果。$K_{\mathrm D}=0$ 且初始化及随机流相同时应还原 Q-learning；额外模型更新不算新的事实样本，但计入计算成本。
+After each real update, Dyna-Q maintains an empirical model from factual records: visit counts $n(q,a)$, reward sample means $\widehat r(q,a)$, and joint next-state and termination frequencies $\widehat P(q',D\mid q,a)$. It then samples $K_{\mathrm D}$ state--action pairs from visited keys and makes additional Q updates using the empirical model. Unvisited entries remain unknown. The learner neither copies evaluation truth nor fills in unobserved action outcomes. With $K_{\mathrm D}=0$ and identical initialization and random streams, Dyna-Q should reproduce Q-learning. Additional model updates are not new factual samples, but their computation is counted.
 
-表格型基线刻画逐任务学习与经验模型重用的效果，不能单独证明 PFN 架构的优势。因此增加相同图--Transformer 网络从零训练的 PPO，以及具有相同跨任务训练预算的对照，以分辨跨任务经验、网络容量和上下文推断各自的贡献。
+Tabular baselines characterize task-specific learning and empirical-model reuse, but do not by themselves establish an advantage of the PFN architecture. We therefore also include PPO trained from scratch with the same graph--Transformer architecture. This comparison evaluates the benefit of transferring cross-task experience while holding the policy architecture fixed.
 
-\subsubsection{推理成本与方法边界}
-候选输出头以一次网络决策代替部署时反复求解。令嵌入宽度为 $h$、图层数为 $L_g$、Transformer 层数为 $L_T$、总令牌数为 $n_{\mathrm{tok}}$，则主要计算量可写为
+\subsubsection{Inference Cost and Method Limitations}
+The candidate output head replaces repeated deployment-time optimization with a network decision. Let $h$ be the embedding width, $L_g$ the number of graph layers, $L_T$ the number of Transformer layers, and $n_{\mathrm{tok}}$ the token count. The main computational cost is
 \begin{equation}
 O\!\left(L_g(|\mathcal E|h+Nh^2)
 +L_T(n_{\mathrm{tok}}^2h+n_{\mathrm{tok}}h^2)+M C_{\mathrm{act}}\right),
 \label{eq:complexity}
 \end{equation}
-其中 $C_{\mathrm{act}}$ 是单个候选评分成本。静态特征可缓存，动态节点状态与历史仍需更新；自回归变体另有 $N$ 步顺序解码。故“直接前向输出”不等于随图规模严格 $O(1)$。若枚举全部分配，候选规模仍可能指数增长；固定候选池通过限制动作空间控制成本，同时限制可达到的策略质量。
+where $C_{\mathrm{act}}$ is the cost of scoring one candidate. Static features can be cached, while dynamic node states and history require updates. The autoregressive variant additionally performs $N$ sequential decoding steps. Direct forward inference is therefore not strictly $O(1)$ in graph size. Enumerating all allocations can still produce an exponentially large catalog. A fixed catalog controls computation by restricting the action space, which also limits achievable policy quality.
 
-对 $n$ 个部署任务，摊销平均成本为
+Across $n$ deployment tasks, average amortized cost is
 \begin{equation}
 \overline C(n)=\frac{C_{\mathrm{train}}}{n}
 +\frac1n\sum_{j=1}^n(C_{\mathrm{catalog},j}+C_{\mathrm{context},j}+C_{\mathrm{decision},j}).
 \label{eq:amortized-cost}
 \end{equation}
-训练交互、专家生成、候选构造和在线推理分别报告。该框架预期在多任务重复部署中体现收益，但盈亏平衡任务数与实际加速幅度需实测。
+Training interactions, expert generation, catalog construction, and online inference are reported separately. The framework is intended to benefit repeated deployment across tasks, but the break-even task count and realized speedup require measurement.
 
-\section{实验与评估（Experiments \& Evaluation）}
+\section{Experiments and Evaluation}
 \label{sec:experiments}
-本节给出统一实验方案，所有实验配置与实测结果的空白处待补入；前述手算实例仅用于检验定义和实现。研究假设是更充分的静态搜索可能改善预测评分、在线反馈可能修正初始排序、冷却规划可能受益于前瞻，以及摊销策略可能降低新任务学习和推理成本。实际结果允许支持、部分支持或否定这些假设。
+The experiments evaluate whether a shared PFN policy can transfer useful allocation decisions to new network environments and use factual feedback efficiently. The main result is a consistent advantage over same-architecture PPO across the new-task learning curve. In cooldown environments, PFN also approaches the catalog-restricted oracle return after a small adaptation budget. Static allocation, online exploration, and known-model planning experiments provide complementary comparisons within the progressive framework.
 
-\paragraph{统一条件。}
-按潜在环境独立划分训练、验证和测试；同一环境的不同预算、噪声轨迹或重排留在同一划分。所有超参数仅依据训练和验证确定。相同设置使用同一图、预算、候选池、时域和评价模型，主比较至少采用五个独立随机种子，并以独立任务为单位报告均值、离散程度及配对差异。学习评价使用独立随机流，不将评估反馈送回训练。公开模型规划器与事实学习器的信息不同，作为参照时标明差别。
+\subsection{Experimental Setup and Evaluation Measures}
+\label{sec:experimental-setup}
+\paragraph{Tasks and implementation.}
+We use the configuration saved with the experimental run. Each environment has $N=60$ nodes, four node features, an at-most budget $B=8$, and a fixed catalog of $M=256$ distinct allocations. The catalog is generated from outcome-independent random nested chains, covers treatment counts from zero to eight, and contains the waiting action. Both fatigue cost (FC) and cooldown (CD) use $T=6$ and $\gamma=1$. The five test environments are evaluated under both dynamics, with five replicate seeds per environment. Table~\ref{tab:configuration} gives the common configuration.
+
+The static response table in this run is estimated by Ridge regression from 64 factual Bernoulli$(1/2)$ network assignments. It is shared by static search, the static allocation PFN, fixed-score bandit selection, and score-based planners. The sequential PFN and the same-architecture PPO baseline use graph features, public state, feasible candidates, and executed-action feedback; they do not receive that estimated response table. The static $T=1$ PFN is a separately trained allocation policy. All empirical PFN results use PPO training and deterministic feasible-candidate selection at evaluation.
 
 \begin{table}[htbp]
 \centering\small
-\caption{统一实验配置（空白处为待填写配置）。}
-\begin{tabularx}{\textwidth}{@{}L L@{}}
-\toprule 配置项 & 取值\\\midrule
-网络数据或生成机制、节点特征 & \\
-节点数、平均度、预算比例与预算模式 & \\
-响应机制、噪声及任务先验范围 & \\
-候选构造方法、候选数与多样性设置 & \\
-时域、折扣、疲劳成本与初始状态 & \\
-训练／验证／测试任务数及随机种子 & \\
-网络宽度、层数、上下文长度与训练参数 & \\
-硬件、线程、求解器时限与批量大小 & \\
+\caption{Configuration of the archived experiment. Counts refer to latent environments unless explicitly described as replicate seeds or episodes.}
+\label{tab:configuration}
+\begin{tabularx}{\textwidth}{@{}p{.28\textwidth}L@{}}
+\toprule Item & Recorded setting\\\midrule
+Graph prior & Equal-probability mixture of ER and three-block SBM; ER edge probability $0.15$; SBM within-/between-block probabilities $0.30/0.05$.\\
+Test networks and features & Five held-out environments: one SBM and four ER; $N=60$; four independent standard-normal features per node. Mean degree $8.31$, with task means ranging from $7.27$ to $9.73$.\\
+Response and noise & Nonlinear direct, spillover, treatment--exposure interaction, and quadratic exposure terms; coefficient entries sampled from $\mathcal N(0,0.5^2)$. Independent node noise SD $0.5$, giving aggregate reward noise SD $0.5/\sqrt{60}$.\\
+Actions and dynamics & $M=256$; $\|\mathbf z\|_1\leq8$; $T=6$; $\gamma=1$; FC cost $c_f=1$; CD waiting time two periods; initial memories zero.\\
+PFN architecture & Width $64$; two graph layers; two Transformer layers; four attention heads; joint candidate head; maximum factual context $384$ records.\\
+PPO optimization & Learning rate $3\times10^{-4}$; GAE $\lambda=0.95$; clipping $0.2$; four epochs; global pretraining minibatch $2{,}048$; value/entropy coefficients $0.5/0.01$; gradient-norm cap $0.5$.\\
+Pretraining and selection & $512$ tasks per update; sequential training uses $200$ six-step episodes per task; validation every $50$ updates on $10$ environments. Selected sequential checkpoint: update $50$; selected static checkpoint: update $300$.\\
+New-task evaluation & Root seed $20261011$; replicate seeds $0$--$4$; $0$--$1{,}200$ adaptation interactions in increments of $120$; eight evaluation episodes per point; deterministic neural evaluation.\\
+Other methods & Dyna-Q: $10$ simulated updates per real step; Q step size $0.1$; exploration $\epsilon:0.30\rightarrow0.05$; GRASP: $16$ restarts; bandit: $1{,}000$ rounds, $\epsilon=0.1$, UCB coefficient $1$.\\
+Hardware and planning & Eight MTT S5000 accelerators; synchronous DDP pretraining; four Torch CPU threads per rank. Evaluation uses independent single-accelerator workers with one CPU thread each. Planning limit: $500{,}000$ states and $120$ seconds.\\
 \bottomrule
 \end{tabularx}
 \end{table}
 
-\subsection{离线求解效率对比}
-比较前期静态 PFN 加 Greedy、Local Swap、GRASP 与 MILP，并纳入 $T=1$ 的摊销 PFN 静态变体。各方法使用相同预测响应表。对有认证最优值的实例报告
+\paragraph{Return and task normalization.}
+The performance objective is the finite-horizon policy return in Equation~\eqref{eq:return}. For a preceding adaptation budget $b$, let $\widehat J_{\psi}(b)$ be the average, over five replicate seeds and eight evaluation episodes, of
 \begin{equation}
-\mathrm{Gap}_{\mathrm{pred}}=\widehat V^*-\widehat V(\mathbf z).
+\sum_{t=0}^{T-1}\gamma^t r_{\mathrm{env},\psi}(q_t,a_t).
+\label{eq:empirical-mean-return}
 \end{equation}
-只有最好已知参照时，报告相对该参照的评分差与 MILP 上界，不称其为精确最优差距。另报 $V_\mu$ 和 $V_{\mathrm{env}}$，避免把预测评分改进等同于真实收益改进。
-
-改变网络规模时同时报告平均度；比较相同时间预算下的质量，以及相同目标质量下的耗时。分别记录响应预测、候选生成、搜索、编码与解码时间，多次采样和搜索细化计入额外成本。Suo Li 的前期结果在核对网络设置、硬件和计时范围后纳入；历史数据与新实验分开注明来源。
-
-\begin{table}[htbp]
-\centering\small
-\caption{离线分配质量与效率（实测数值留空）。}
-\begin{tabularx}{\textwidth}{@{}L c c c c@{}}
-\toprule 方法 & $\widehat V$ & $V_{\mathrm{env}}$ & 预测差距 & 决策时间\\\midrule
-Greedy & & & & \\
-Greedy + Local Swap & & & & \\
-GRASP + Local Swap & & & & \\
-MILP & & & & \\
-摊销 PFN 静态策略 & & & & \\
-\bottomrule
-\end{tabularx}
-\end{table}
-\noindent 结果分析：\resultspace
-
-\subsection{在线学习的 Regret 表现}
-在无动态的固定环境中比较 Random、$\varepsilon$-greedy、UCB、FrozenPFN 和历史条件 PFN。绘制累计观测奖励与式~\eqref{eq:regret} 的累计伪遗憾，横轴为全部真实交互次数，包含初始化。改变候选数、噪声、时域和初始预测排序与真实排序的相关性，考察探索成本及有限时域收益。不得用每轮最大噪声奖励作为最优参照。
-
-\begin{table}[htbp]
-\centering\small
-\caption{固定候选池上的在线探索结果（实测数值留空）。}
-\begin{tabularx}{\textwidth}{@{}L c c c@{}}
-\toprule 方法 & 累计奖励 & 累计伪遗憾 & 单轮决策时间\\\midrule
-Random & & & \\
-$\varepsilon$-greedy & & & \\
-UCB & & & \\
-FrozenPFN & & & \\
-历史条件 PFN & & & \\
-\bottomrule
-\end{tabularx}
-\end{table}
-\noindent 伪遗憾曲线与结果分析：\resultspace
-
-\subsection{规划算法的前瞻收益验证}
-分别在 FC 与 CD 上比较短视选择、不同深度的滚动规划和精确动态规划。对于指定评分模型，报告
+Here the evaluator replaces each executed action's noisy reward with its true conditional mean, while the policy continues to observe factual noisy feedback. Thus evaluation retains the actual feedback-dependent trajectories and reduces external reward noise. Observed-reward results are reported in Appendix~\ref{sec:supplementary-results}. We solve the true-model planning problem within the same catalog to obtain $J^*_{\psi,\mathrm{env}}>0$, and define the task-normalized return
 \begin{equation}
-\mathrm{Gap}_{\mathrm{plan}}(\pi)=V_{\mathrm{score},T}(x_0)-J_{\mathrm{score}}(\pi).
+s_{\psi}(b)=100\,\frac{\widehat J_{\psi}(b)}{J^*_{\psi,\mathrm{env}}}.
+\label{eq:normalized-return}
 \end{equation}
-参照必须具有相同的候选池、起点和总时域。模型内计划价值与实际执行期望回报分列；若真实模型可精确求解，再单列实际最优差距。无精确参照的大图不填最优差距。
+Every environment has equal weight: normalization is performed before averaging across the five environments. The reported dispersion is the sample standard deviation of task means. To summarize the full adaptation curve, we use
+\begin{equation}
+\mathrm{AUC}_{\psi}=\frac{1}{1200}\int_{0}^{1200}s_{\psi}(b)\,\mathrm db,
+\label{eq:normalized-auc}
+\end{equation}
+computed by the trapezoidal rule on the eleven recorded evaluation points. This quantity measures average evaluation quality over the adaptation budget, rather than cumulative rewards collected while adapting.
 
-FC 严格人数模式应验证短视与精确规划相同，最多人数模式应验证深度二的滚动执行达到精确价值。CD 通过式~\eqref{eq:cd-example} 及更复杂实例检验前瞻收益，不能预设所有网络中都存在严格优势。记录访问状态数、动作评估数、内存、搜索深度和总规划耗时，以呈现状态空间增长。
+\paragraph{New-task protocol.}
+At $b=0$, the policy has no preceding adaptation records from the new task. It can use earlier feedback within the six-step evaluation episode. At later points, each evaluation episode starts from a private copy of the adaptation context, and its feedback is discarded after that episode. Separate evaluation streams add $11\times8\times6=528$ evaluation interactions per method--task--seed--dynamics combination; these interactions do not train the policy or carry into subsequent adaptation. PFN weights remain fixed throughout deployment. PPO from scratch has the same architecture and uses the same factual adaptation budget, with task-specific gradient updates. Training, validation, and test environment seeds are separated. All replicate seeds evaluate the same validation-selected pretrained checkpoint.
 
-\begin{table}[htbp]
-\centering\small
-\caption{有限时域规划结果（按预算和规模分别填写；实测数值留空）。}
-\begin{tabularx}{\textwidth}{@{}l L c c c@{}}
-\toprule 动态类型 & 方法 & 计划价值 & 实际回报 & 规划时间\\\midrule
-FC & 短视选择 & & & \\
-FC & 滚动规划 & & & \\
-FC & 精确动态规划 & & & \\
-CD & 短视选择 & & & \\
-CD & 滚动规划 & & & \\
-CD & 精确动态规划 & & & \\
-\bottomrule
-\end{tabularx}
-\end{table}
-\noindent 前瞻收益与可扩展性分析：\resultspace
+\subsection{Sample Efficiency of the Amortized PFN}
+\label{sec:pfn-results}
+\paragraph{Strong decisions at the start of a new task.}
+PFN transfers a high-quality policy before task-specific weight optimization. In CD, its initial normalized return is $90.62\%$, compared with $51.92\%$ for PPO from scratch. After only $120$ factual adaptation interactions, PFN reaches $95.20\%$ and remains close to that level through the rest of the evaluation budget. PPO reaches $86.96\%$ after $1{,}200$ interactions, below PFN's initial task-averaged performance. In FC, PFN starts at $75.13\%$, compared with PPO's $42.23\%$, and reaches $85.57\%$ at $120$ interactions. This also exceeds PPO's final task-averaged value of $84.20\%$.
 
-\subsection{端到端摊销 PFN 的性能评估（核心实验）}
-\subsubsection{样本效率与长期收益}
-在未知模型的 FC 与 CD 环境中，比较 Q-learning、不同 $K_{\mathrm D}$ 的 Dyna-Q、逐任务从零训练的同架构 PPO，以及共享 PFN 策略。以新任务真实交互次数为横轴，报告独立评估中的冻结参数策略回报；PFN 可以在评估回合内更新事实上下文，但不更新权重。若使用前序适应回合，其交互一并计数。
-
-记录零交互起点、不同上下文量的收益、学习曲线面积和达到预设目标回报所需交互数；目标阈值预先在验证阶段确定，未达到时报告未达到而不外推。候选数和图规模较大、表格基线不可运行时如实报告资源限制，并使用函数逼近对照。PFN 的预训练任务数、事实交互总数与训练时间另列，不能把预训练经验视作零样本成本。
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{figures/learning_curves.pdf}
+\caption{New-task learning curves with a fixed pretrained PFN and task-specific baselines. Each return is divided by the true-model optimum for the same task and catalog, then averaged across five environments. Shading denotes one sample standard deviation across task means, after averaging the five replicate seeds. The horizontal axis counts preceding factual adaptation interactions; evaluation episodes are additional. PFN updates its context while keeping weights frozen.}
+\label{fig:learning-curves}
+\end{figure}
 
 \begin{table}[htbp]
 \centering\small
-\caption{未知模型下的测试任务学习效率（FC 与 CD 分别填写）。}
-\begin{tabularx}{\textwidth}{@{}L c c c c@{}}
-\toprule 方法 & 长期回报 & 目标交互数 & 模型内更新数 & 非法动作数\\\midrule
-Q-learning & & & & \\
-Dyna-Q & & & & \\
-同架构 PPO（从零训练） & & & & \\
-摊销 PFN（REINFORCE） & & & & \\
-摊销 PFN（PPO） & & & & \\
+\caption{Task-normalized policy performance (percent). Entries are mean $\pm$ sample SD across five environments. AUC is normalized by the $1{,}200$-interaction budget. All methods share the catalog, test environments, and real adaptation budget.}
+\label{tab:learning}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}llrrrr@{}}
+\toprule
+Dynamics & Method & $b=0$ & $b=120$ & $b=1200$ & AUC\\\midrule
+FC & Q-learning & $42.38\pm13.22$ & $48.33\pm16.57$ & $55.21\pm15.91$ & $52.26\pm17.38$\\
+& Dyna-Q & $42.38\pm13.22$ & $47.97\pm16.58$ & $56.83\pm12.50$ & $52.95\pm12.99$\\
+& PPO from scratch & $42.23\pm10.40$ & $52.20\pm12.42$ & $84.20\pm4.71$ & $65.71\pm9.08$\\
+& \textbf{PFN (ours)} & $\mathbf{75.13}\pm20.47$ & $\mathbf{85.57}\pm19.31$ & $\mathbf{84.69}\pm21.43$ & $\mathbf{86.41}\pm16.74$\\\midrule
+CD & Q-learning & $51.17\pm1.83$ & $56.74\pm5.31$ & $57.51\pm5.46$ & $56.80\pm5.05$\\
+& Dyna-Q & $51.17\pm1.83$ & $53.18\pm3.12$ & $62.04\pm4.16$ & $58.41\pm3.37$\\
+& PPO from scratch & $51.92\pm15.14$ & $59.99\pm19.04$ & $86.96\pm4.79$ & $70.71\pm12.52$\\
+& \textbf{PFN (ours)} & $\mathbf{90.62}\pm8.15$ & $\mathbf{95.20}\pm4.95$ & $\mathbf{95.13}\pm4.97$ & $\mathbf{94.86}\pm5.02$\\
 \bottomrule
-\end{tabularx}
+\end{tabular*}
 \end{table}
-\noindent 样本效率曲线与结果分析：\resultspace
 
-\subsubsection{推理速度与摊销收益}
-部署延迟区分单次决策与整个回合。静态策略与组合优化器比较时统一为同一个单期目标；动态策略与规划器比较时统一为同一有限时域目标，避免把单期分配与长期策略的耗时和质量混合排名。报告同硬件上的中位数与高分位延迟、批量大小、缓存状态、内存占用及质量--时间曲线。
+\paragraph{Consistent benefit across the learning curve.}
+PFN attains normalized AUC values of $86.41\%$ in FC and $94.86\%$ in CD. The corresponding PPO values are $65.71\%$ and $70.71\%$, giving PFN advantages of $20.70$ and $24.15$ percentage points. The paired AUC difference is positive on all five environments under each dynamics setting (Figure~\ref{fig:taskwise-gains}). The advantage therefore reflects improved learning-curve performance across the task set. On the unnormalized mean-reward scale, PFN raises budget-averaged evaluation return by $36.50\%$ in FC and $36.60\%$ in CD relative to PPO. Its near-flat CD curve after the first $120$ interactions represents rapid attainment and sustained deployment quality.
 
-若端到端系统仍需响应预测或候选搜索，则单列并计入冷启动延迟；固定候选预计算后的速度也单列。按式~\eqref{eq:amortized-cost} 随部署任务数绘制平均成本，检验是否存在摊销收益。性能假设是部署阶段减少反复搜索，而非无条件的常数时间复杂度或必然加速。
+\paragraph{Final return and task variation.}
+At $1{,}200$ interactions, PFN's mean-reward return is $0.8894$ in FC and $1.4344$ in CD, compared with $0.8272$ and $1.3137$ for PPO. In CD, PFN leads PPO by $8.18$ normalized percentage points and has a positive final-return difference on every environment. It also exceeds Dyna-Q and Q-learning, whose final normalized returns are $62.04\%$ and $57.51\%$.
+
+FC primarily demonstrates an advantage in initial decisions and adaptation efficiency: its final normalized mean is close to PPO's. Four FC environments favor PFN at the final checkpoint. On the fifth, task~2, PFN attains $47.03\%$ of the oracle value and PPO attains $79.32\%$; the other four PFN values range from $90.20\%$ to $100\%$. This task variation explains the remaining spread in the normalized FC curve. PFN still has a positive AUC difference on task~2, as well as on the other four tasks. The same-architecture comparison therefore supports transferring useful cross-task decision rules and obtaining strong performance early in deployment.
+
+\paragraph{Adaptation through factual context.}
+PFN uses zero deployment gradient updates, whereas PPO performs $40$ by the final checkpoint. Both neural methods may retain up to $384$ factual records. PFN improves from $75.13\%$ to $85.57\%$ in FC and from $90.62\%$ to $95.20\%$ in CD over the first $120$ interactions with fixed weights. The observed improvement is achieved through additional task feedback available to the pretrained policy. Dyna-Q performs $1{,}200$ factual and $12{,}000$ simulated temporal-difference updates, and Q-learning performs $1{,}200$ factual updates. All $105{,}600$ recorded evaluation actions satisfy the budget and availability constraints.
+
+\FloatBarrier
+\subsection{Static Allocation Quality}
+\label{sec:static-results}
+We compare methods on the same predicted response table and the same $256$-allocation catalog. The exact reference enumerates the catalog scores, so the reported gap is
+$\max_{\mathbf z\in\mathcal C}\widehat V(\mathbf z)-\widehat V(\mathbf z_{\mathrm{method}})$.
+The measured search methods are catalog-constrained Greedy, Local Swap, and GRASP. Table~\ref{tab:static-results} keeps predicted score, design-standardized majority score, and environment reward separate.
 
 \begin{table}[htbp]
 \centering\small
-\caption{同目标下的部署成本比较（静态与动态面板分别填写）。}
-\begin{tabularx}{\textwidth}{@{}L c c c c@{}}
-\toprule 方法 & 候选准备 & 决策延迟 & 整回合耗时 & 预训练成本\\\midrule
-静态组合优化器 & & & & \\
-摊销静态策略 & & & & \\
-有限时域规划器 & & & & \\
-摊销序贯策略 & & & & \\
+\caption{Static allocation quality on the fixed catalog. Entries are task means. The final column is the per-task percentage of the exact catalog prediction score, averaged across environments. The exact row refers to catalog enumeration.}
+\label{tab:static-results}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lrrrrr@{}}
+\toprule Method & $\widehat V$ & $V_\mu$ & $V_{\mathrm{env}}$ & Predicted gap & Score (\%)\\\midrule
+Greedy & 0.40144 & 0.39573 & 0.18455 & 0.04083 & 90.08\\
+Greedy + Local Swap & 0.40144 & 0.39573 & 0.18455 & 0.04083 & 90.08\\
+GRASP & 0.43574 & 0.43759 & 0.24810 & 0.00654 & 98.05\\
+\textbf{PFN ($T=1$)} & \textbf{0.43962} & \textbf{0.43897} & \textbf{0.24955} & \textbf{0.00265} & \textbf{99.21}\\
+Catalog exact & 0.44227 & 0.44269 & 0.26239 & 0 & 100.00\\
 \bottomrule
-\end{tabularx}
+\end{tabular*}
 \end{table}
-\noindent 推理速度与摊销成本分析：\resultspace
 
-\subsubsection{消融、泛化与独立核对}
+The static PFN attains $99.21\%$ of the catalog's best predicted score on average and selects a catalog-optimal candidate on three of the five environments. Its mean predicted gap, $0.00265$, is smaller than GRASP's $0.00654$ and Greedy's $0.04083$. Its actual expected static reward is $0.24955$, compared with $0.24810$ for GRASP and $0.18455$ for Greedy. Thus the learned allocation policy preserves high catalog-level allocation quality across held-out networks. Local Swap returns the same allocation quality as Greedy on these instances. Timing, including the distinction between first and subsequent neural calls, is reported in Section~\ref{sec:deployment-results}.
+
+\subsection{Online Exploration with a Fixed Catalog}
+\label{sec:bandit-results}
+The no-dynamics experiment compares Random, $\epsilon$-greedy, UCB, and a frozen Ridge-score ranking over $1{,}000$ online rounds. The frozen ranking selects the largest predicted catalog score and uses the $64$ upstream randomized assignments described above. This panel evaluates the utility of an informative initial ranking and the cost of learning arm values from online observations; its frozen-score row is distinct from the learned PFN policy.
+
 \begin{table}[htbp]
 \centering\small
-\caption{核心策略的消融与泛化实验。}
-\begin{tabularx}{\textwidth}{@{}p{.23\textwidth}L@{}}
-\toprule 因素 & 对照及研究目的\\\midrule
-图结构 & GCN、GAT 与无消息传递模型，检验拓扑信息的作用。\\
-事实上下文 & 移除历史、仅使用访问统计、不同窗口长度，区分反馈适应与固定先验。\\
-静态预测输入 & 无预测输入与附加预测表，评价先验评分的信息贡献并计入上游成本。\\
-联合动作表示 & 去掉动作交互头、候选分类与前缀解码，检验联合依赖。\\
-训练来源 & 从零训练、跨任务训练、可选专家初始化；控制训练量并标记额外信息。\\
-推理方式 & 随机采样、确定性输出、多次采样与局部细化，统一计算预算。\\
-动作覆盖 & 改变候选规模与多样性，在小图对照全部合法分配，估计候选限制的损失。\\
-分布外泛化 & 分别改变网络规模、平均度、预算、噪声、响应机制和时域。\\
+\caption{Fixed-catalog online exploration over $1{,}000$ rounds. Reward and pseudo-regret are mean $\pm$ task SD; latency is mean decision time in microseconds. The $64$ upstream randomized assignments used to fit the frozen score are additional to the horizontal-axis online budget.}
+\label{tab:bandit-results}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lrrr@{}}
+\toprule Method & Observed cumulative reward & Cumulative pseudo-regret & Decision ($\mu$s)\\\midrule
+Random & $139.89\pm57.69$ & $130.46\pm40.15$ & 9.31\\
+$\epsilon$-greedy & $228.10\pm87.39$ & $42.25\pm12.34$ & 5.61\\
+UCB & $186.49\pm89.20$ & $83.86\pm9.41$ & 10.35\\
+Frozen Ridge score & $262.28\pm85.41$ & $8.07\pm17.68$ & 4.10\\
 \bottomrule
-\end{tabularx}
+\end{tabular*}
 \end{table}
 
-小图通过独立枚举核对规划；检查 $T=1$ 的单期退化、FC 可分性质、CD 两期不可用与第三期恢复。单候选、相同臂均值和零预算时 Bandit 伪遗憾应为零。完整动作概率应归一化，表外或冷却非法动作概率应为零；全部节点不可用时选择等待。模拟器在生成噪声和推进状态之前拒绝非法动作。
+The frozen ranking achieves the largest observed cumulative reward and the smallest pseudo-regret in this panel. Its mean regret is $8.07$, compared with $42.25$ for $\epsilon$-greedy, $83.86$ for UCB, and $130.46$ for Random. Figure~\ref{fig:bandit-regret} shows the corresponding accumulation over all online rounds. These results show the practical value of useful prior allocation information when a large catalog must be explored within a finite budget. The sequential PFN results in Section~\ref{sec:pfn-results} extend the evaluation to learned policies that also account for physical aftereffects and factual history.
 
-对经验模型以手算轨迹核对访问次数、奖励均值和转移频率；终点目标只含即时奖励，Dyna-Q 的零额外更新应复现 Q-learning。恢复训练应保持参数、经验模型、候选顺序和随机状态一致；冻结评估不得改变训练状态。学习接口的测试禁止读取隐藏奖励表，以核对“仅使用事实反馈”的条件。
+\FloatBarrier
+\subsection{Planning and Direct Policy Evaluation}
+\label{sec:planning-results}
+Score-based myopic selection, depth-two rolling planning, and exact dynamic programming receive the same predicted catalog rewards. An additional oracle planner receives the true environment means. We report each planner's own planned objective together with the environment mean reward of its executed allocation trajectory. This separates the effect of planning from the quality of the reward model.
 
-\noindent 消融结果、泛化结果及核对记录：\resultspace
+\begin{table}[htbp]
+\centering\small
+\caption{Finite-horizon planning on the same catalog and six-period horizon. Values are task means. ``Score'' uses the Ridge-derived majority-exposure objective; ``Env'' uses the true conditional reward means. Time includes initial solution and action selection over one episode.}
+\label{tab:planning-results}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lllrrrr@{}}
+\toprule Dynamics & Method & Model & Planned value & Env return & Score gap & Time (s)\\\midrule
+FC & Myopic & Score & 2.00363 & 0.92434 & 0.10350 & 0.00402\\
+& Rolling ($d=2$) & Score & 2.10713 & 0.81677 & 0 & 0.67106\\
+& Exact DP & Score & 2.10713 & 0.81677 & 0 & 0.97824\\
+& Oracle DP & Env & 0.97337 & 0.97337 & --- & 0.97868\\\midrule
+CD & Myopic & Score & 2.51337 & 1.39387 & 0.04308 & 0.00319\\
+& Rolling ($d=2$) & Score & 2.54714 & 1.39860 & 0.00931 & 0.45841\\
+& Exact DP & Score & 2.55645 & 1.42410 & 0 & 17.35295\\
+& Oracle DP & Env & 1.49792 & 1.49792 & --- & 17.56860\\
+\bottomrule
+\end{tabular*}
+\end{table}
 
-\section{结论与未来工作（Conclusion）}
-本文围绕网络干涉下的资源分配建立统一决策框架：从给定响应评分后的静态组合优化出发，引入无物理动态时的在线探索，再通过历史状态建模形成有限时域规划问题，最终提出由图神经网络、Transformer 和合法动作掩码组成的摊销 PFN 序贯策略。其核心目标是以长期回报直接训练完整分配的联合决策，在新任务中通过事实上下文适应，减少重复求解与逐任务重新训练的需求。
+\paragraph{Planning behavior follows the dynamics.}
+Under the at-most FC budget, depth-two rolling execution exactly matches the score-based dynamic-programming value on every task, as predicted by Equation~\eqref{eq:fatigue-cost-separable}. In CD, rolling depth two reduces the average score gap from $0.04308$ to $0.00931$; exact planning further raises the environment return from the myopic value of $1.39387$ to $1.42410$. The additional temporal coupling also increases the recorded search effort: exact DP visits an average of $222{,}820$ states and evaluates $22.72$ million actions in CD, compared with $1{,}537$ states and $327{,}936$ action evaluations in FC.
 
-本框架明确区分预测多数评分与实际干预收益、公开模型规划与有限反馈学习、候选集内最优与完整预算空间最优。当前一期疲劳成本具有可分结构，两期冷却约束提供更直接的跨期机会耦合。PFN 在样本效率、长期收益和部署速度上的实际优势，需要由上述实验填入结果后判断，不从模型架构或手算实例直接推出。
+\paragraph{Learning the deployed return directly.}
+The distinction between score quality and environment reward is visible in FC: exact score optimization raises the planned value while yielding environment return $0.81677$, compared with $0.92434$ for the myopic score policy. This is consistent with the separate objectives in Equation~\eqref{eq:three-values}. PFN's direct factual-return training yields $0.88935$ in FC and $1.43435$ in CD after adaptation, compared with $0.81677$ and $1.42410$ for exact score-based planning. The true-model oracle values are $0.97337$ and $1.49792$. These results support directly training the decision policy for executed outcomes while using model-based optimization as a clearly defined reference.
 
-未来工作将研究节点特异的重复干预衰减、累积疲劳与恢复、疲劳和冷却联合机制，以及跨期总预算。这些扩展需要相应增加状态并重新明确因果假设。方法层面可研究不依赖固定候选池的受约束结构化生成、稀疏历史注意力、先验错配下的稳健适应，以及只有观察性日志时的离线策略学习与评估。最终目标是在可解释的因果建模与可核验的决策质量之间，建立可扩展的网络序贯干预方法。
+\FloatBarrier
+\subsection{Deployment Computation and Pretraining Cost}
+\label{sec:deployment-results}
+\paragraph{Online decision computation.}
+With $384$-record contexts, PFN's six action calls take an average of $32.49$ ms in FC and $32.39$ ms in CD, or about $5.4$ ms per decision. The episode-level 95th percentiles are $34.29$ ms and $33.66$ ms. Same-architecture PPO has similar inference costs. PFN's additional deployment advantage is that this decision quality requires no new-task optimizer steps.
+
+\begin{table}[htbp]
+\centering\small
+\caption{Decision and adaptation costs at $1{,}200$ preceding interactions. The first three numeric columns describe the sum of six action-call timers per evaluation episode (200 recorded episodes per row). Adaptation time includes factual rollout collection and any training updates, but excludes independent evaluation. Neural policies run on one accelerator; tabular methods use a single CPU thread.}
+\label{tab:deployment}
+\setlength{\tabcolsep}{4pt}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}llrrrrr@{}}
+\toprule Dynamics & Method & Mean (ms) & Median (ms) & P95 (ms) & Adaptation (s) & Grad. steps\\\midrule
+FC & Q-learning & 0.063 & 0.058 & 0.083 & 0.198 & 0\\
+& Dyna-Q & 0.063 & 0.059 & 0.081 & 0.438 & 0\\
+& PPO from scratch & 33.033 & 32.567 & 36.012 & 8.695 & 40\\
+& PFN (ours) & 32.486 & 32.371 & 34.286 & 6.724 & 0\\\midrule
+CD & Q-learning & 0.064 & 0.062 & 0.071 & 0.214 & 0\\
+& Dyna-Q & 0.065 & 0.063 & 0.076 & 0.466 & 0\\
+& PPO from scratch & 33.595 & 32.805 & 38.844 & 8.597 & 40\\
+& PFN (ours) & 32.392 & 32.424 & 33.657 & 6.814 & 0\\
+\bottomrule
+\end{tabular*}
+\end{table}
+
+For a new CD task, exact score-based planning takes $17.35$ seconds including solution and episode action selection, while an adapted PFN's six action calls take $0.0324$ seconds in the recorded CPU-planner/accelerator-policy configuration. PFN thus moves substantial new-instance solution work into shared training. These costs distinguish a new planning problem from later reuse of an already solved DP table. Tabular lookups are inexpensive at this scale, while PFN provides much higher returns (Table~\ref{tab:learning}).
+
+\paragraph{Preparation and first calls.}
+Average graph/catalog generation, Ridge prediction, and combined score/environment caching take $5.61$, $3.87$, and $2.01$ ms per task, respectively. These preparation records are separate from method decision timers. Static catalog enumeration takes $0.008$ ms once all candidate scores are available. The static PFN's first recorded call in each of the eight worker processes averages $8.891$ seconds; the remaining $17$ calls average $5.303$ ms, with median $5.258$ ms and P95 $5.746$ ms. Reporting these two groups separately characterizes both first-call overhead and subsequent inference. The recorded first-call timers do not include full process and model-loading startup. Action-call timings throughout this section exclude environment stepping and external context bookkeeping.
+
+\paragraph{Training investment and reuse.}
+The selected sequential PFN checkpoint follows $50$ updates over $25{,}600$ training environments and $30{,}720{,}000$ factual interactions. Its cumulative timed training updates take $11{,}662.00$ seconds ($3.24$ hours). Selection uses validation return after $120$ adaptation interactions. The archived training log continues to update $161$, totaling $98{,}918{,}400$ interactions and $36{,}211.61$ seconds ($10.06$ hours); the configured $300$ updates are the planned cap. Table~\ref{tab:training-cost} distinguishes the selected checkpoint from the work recorded for the full archived run. Across new tasks, these shared training costs are amortized according to Equation~\eqref{eq:amortized-cost}, while the deployed model performs context-based decisions without task-specific gradient updates.
+
+\begin{table}[htbp]
+\centering\small
+\caption{Recorded pretraining work. Timed updates include task generation, rollout collection, and PPO optimization; validation, checkpoint writing, and setup outside the update loop are separate. Static training additionally uses 64 randomized assignments per training task to construct the response table.}
+\label{tab:training-cost}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}lrrrr@{}}
+\toprule Model / record & Update & Training tasks & Policy interactions & Time (s)\\\midrule
+Static PFN, selected & 300 & $153{,}600$ & $153{,}600$ & 97.10\\
+Sequential PFN, selected & 50 & $25{,}600$ & $30{,}720{,}000$ & $11{,}662.00$\\
+Sequential, last logged & 161 & $82{,}432$ & $98{,}918{,}400$ & $36{,}211.61$\\
+\bottomrule
+\end{tabular*}
+\end{table}
+
+\paragraph{Result verification.}
+Reconstructing the five test environments from the archived configuration reproduces their adjacency matrices, features, and catalogs exactly. Reconstructing the 64-assignment Ridge response tables agrees with the saved predictions to numerical precision. Aggregating the $17{,}600$ saved evaluation episodes reproduces all $2{,}200$ learning-curve rows, and recomputing catalog scores from saved arrays reproduces the static results. These checks connect the reported policy comparisons to the underlying environment and evaluation records. The completed experiment establishes in-prior transfer, fixed-weight adaptation, and deployment computation for this catalog and network size.
+
+\FloatBarrier
+\appendix
+\section{Supplementary Experimental Results}
+\label{sec:supplementary-results}
+\subsection{Unnormalized Returns and Paired Task Differences}
+Table~\ref{tab:raw-returns} reports both the observed evaluation return and the mean-reward evaluation return used in the main analysis. Evaluation noise streams are paired across methods, so their additive observed-minus-mean-reward difference is shared within each task, seed, and evaluation episode. The method-to-method paired differences consequently agree under both recorded return definitions. Figure~\ref{fig:raw-learning-curves} retains the unnormalized scale, while Figure~\ref{fig:taskwise-gains} shows the paired normalized results for each environment.
+
+\begin{table}[htbp]
+\centering\small
+\caption{Returns after $1{,}200$ adaptation interactions, reported as mean $\pm$ sample SD across the five environments.}
+\label{tab:raw-returns}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}llrr@{}}
+\toprule Dynamics & Method & Mean-reward return & Observed return\\\midrule
+FC & Q-learning & $0.5899\pm0.4224$ & $0.6046\pm0.4208$\\
+& Dyna-Q & $0.6051\pm0.4592$ & $0.6199\pm0.4577$\\
+& PPO from scratch & $0.8272\pm0.4966$ & $0.8419\pm0.4949$\\
+& PFN (ours) & $0.8894\pm0.6127$ & $0.9041\pm0.6113$\\\midrule
+CD & Q-learning & $0.8493\pm0.3173$ & $0.8640\pm0.3146$\\
+& Dyna-Q & $0.9278\pm0.3756$ & $0.9425\pm0.3733$\\
+& PPO from scratch & $1.3137\pm0.5608$ & $1.3284\pm0.5591$\\
+& PFN (ours) & $1.4344\pm0.6016$ & $1.4491\pm0.6000$\\
+\bottomrule
+\end{tabular*}
+\end{table}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{figures/learning_curves_raw.pdf}
+\caption{Mean-reward evaluation returns before task normalization. Lines and shading are task means and one task-level sample SD. The variation reflects both differences in reward scale between environments and differences in policy quality.}
+\label{fig:raw-learning-curves}
+\end{figure}
+
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=\textwidth]{figures/taskwise_pfn_advantage.pdf}
+\caption{Paired PFN--PPO differences within each test environment, in normalized percentage points. Left: budget-normalized learning-curve AUC. Right: return after $1{,}200$ adaptation interactions. Each point averages five replicate seeds; task identifiers follow the archived data. The same underlying five environments are used for FC and CD.}
+\label{fig:taskwise-gains}
+\end{figure}
+
+\FloatBarrier
+\subsection{Validation-Calibrated Target Attainment}
+The archived absolute return thresholds are $0.286135$ for FC and $0.699989$ for CD. Each is set on validation environments as
+\begin{equation}
+\tau=\overline J_{\mathrm{random,val}}+0.8\bigl(\overline J^*_{\mathrm{env,val}}-\overline J_{\mathrm{random,val}}\bigr).
+\end{equation}
+These thresholds are different from the per-task oracle percentages in Equation~\eqref{eq:normalized-return}. A hit is the first recorded evaluation point whose mean observed return reaches or exceeds the threshold. To retain all replicates, Table~\ref{tab:targets} reports both the hit counts and a capped mean budget, assigning $1{,}200$ to runs with no observed hit. The resulting statistic summarizes performance within the evaluated budget without dropping unsuccessful runs.
+
+\begin{table}[htbp]
+\centering\small
+\caption{Validation-target attainment over 25 task--seed replicates. Hit counts are descriptive repeat-level counts from five independent environments. ``Capped mean'' uses the first observed hit and caps nonattainment at $1{,}200$ interactions; evaluations occur every $120$ interactions.}
+\label{tab:targets}
+\begin{tabular*}{\textwidth}{@{\extracolsep{\fill}}llrrr@{}}
+\toprule Dynamics & Method & Hit at $b=0$ & Hit by $b=1200$ & Capped mean budget\\\midrule
+FC & Q-learning & 16/25 & 19/25 & 307.2\\
+& Dyna-Q & 16/25 & 19/25 & 307.2\\
+& PPO from scratch & 15/25 & 25/25 & 220.8\\
+& PFN (ours) & 20/25 & 24/25 & 110.4\\\midrule
+CD & Q-learning & 11/25 & 16/25 & 460.8\\
+& Dyna-Q & 11/25 & 16/25 & 480.0\\
+& PPO from scratch & 11/25 & 24/25 & 273.6\\
+& PFN (ours) & 24/25 & 25/25 & 4.8\\
+\bottomrule
+\end{tabular*}
+\end{table}
+
+\subsection{Online Regret and Checkpoint Selection}
+\begin{figure}[htbp]
+\centering
+\includegraphics[width=.82\textwidth]{figures/bandit_regret.pdf}
+\caption{Cumulative pseudo-regret in the fixed-catalog bandit experiment. Lines show task means and shading denotes one sample SD across five environments. The frozen Ridge score uses upstream factual experimental data; it is not the learned PFN policy.}
+\label{fig:bandit-regret}
+\end{figure}
+
+The sequential validation criterion averages FC and CD return after $120$ adaptation interactions. Its values at updates $50$, $100$, and $150$ are $0.50410$, $0.47845$, and $0.44819$, respectively. The evaluation therefore uses the update-$50$ checkpoint selected by this criterion. Its separate FC/CD validation returns are $0.26265/0.74555$. The static checkpoint is selected at update $300$, with validation score $0.29299$. The supplementary data include all archived training rows and validation records, alongside task-level curves, paired differences, timing classifications, and the script used to regenerate the tables and figures.
+\FloatBarrier
+
 
 \clearpage
 \begin{thebibliography}{99}
@@ -625,3 +738,4 @@ Schulman J, Moritz P, Levine S, Jordan M, Abbeel P. High-dimensional continuous 
 Watkins C J C H, Dayan P. Q-learning. \emph{Machine Learning}, 1992, 8: 279--292. \url{https://doi.org/10.1007/BF00992698}.
 \end{thebibliography}
 \end{document}
+
